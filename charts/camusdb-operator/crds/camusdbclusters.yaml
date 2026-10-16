@@ -1259,7 +1259,7 @@ spec:
                   type: string
                 type: array
               image:
-                default: camusdb/camusdb:0.15.1
+                default: camusdb/camusdb:0.15.2
                 description: |-
                   image is the CamusDB server image. The operator overrides the image entrypoint with its own
                   generated startup script, so the stock single-node image works unmodified.

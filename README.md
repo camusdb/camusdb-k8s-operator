@@ -142,9 +142,8 @@ Changing configuration rolls the cluster; changing `replicas` does not.
 
 ## Authentication
 
-> **Needs a CamusDB server with node-to-node mutual TLS** (the `raft_mutual_tls_enabled` setting).
-> CamusDB 0.15.1, the default image, does not have it and rejects the setting at startup, so set
-> `spec.image` to a newer server before you turn authentication on. See [Known gaps](#known-gaps).
+> **Needs CamusDB 0.15.2 or later**, the default image. Authentication turns on node-to-node mutual
+> TLS (`raft_mutual_tls_enabled`), which 0.15.1 does not have and rejects at startup.
 
 ```yaml
 spec:
@@ -230,7 +229,7 @@ ready node's signals cannot be read, and it never scales down on a partial view,
 node may be the leader carrying the load. Log entries are not statements: one transaction writes
 several (its prepare, decision and settle), so calibrate the target against a representative
 workload. CPU is the only signal that sees read load. `targetCPUPercent` needs a server that serves
-`/v1/admin/stats`, which `camusdb/camusdb:0.15.1` predates.
+`/v1/admin/stats`, which CamusDB 0.15.2 does and 0.15.1 does not.
 
 ## TLS
 
@@ -282,7 +281,7 @@ content changes rolls the nodes the same way, at the next resync.
 
 ## Server version
 
-`spec.image` defaults to an exact tag, `camusdb/camusdb:0.15.1`, rather than to `latest`. A floating
+`spec.image` defaults to an exact tag, `camusdb/camusdb:0.15.2`, rather than to `latest`. A floating
 tag re-rolls a running cluster on a registry push, and the generated command line is
 version-specific: CamusDB's parser rejects an option it does not define and the node exits. Raise
 the tag deliberately, after checking the flags against that release.
@@ -325,11 +324,10 @@ CAMUSDB_IMAGE=camusdb/camusdb:dev CAMUSDB_IMAGE_SKIP_PULL=true make test-e2e
 
 ## Known gaps
 
-- **Authentication needs a newer server than the default image.** It depends on CamusDB's
-  node-to-node mutual TLS, which `camusdb/camusdb:0.15.1` does not have: that server demands a
-  bearer token on the Raft and Kahuna gRPC routes, so its nodes refuse each other's consensus traffic
-  and a multi-node cluster never forms. With 0.15.1, run without `spec.auth`, which means scale-down
-  by eviction and no autoscaling.
+- **Authentication needs CamusDB 0.15.2 or later.** It depends on node-to-node mutual TLS. A
+  0.15.1 server rejects the setting at startup, and even without it, that server demands a bearer
+  token on the Raft and Kahuna gRPC routes, so a multi-node cluster never forms. With 0.15.1, run
+  without `spec.auth`, which means scale-down by eviction and no autoscaling.
 - **Node-to-node HTTP is plaintext.** CamusDB forwards schema changes and cluster settings between
   nodes over the HTTP port, carrying the shared node secret in a header. Its `peer_tls_enabled`
   setting needs HTTPS on the HTTP port itself, which a cluster node does not serve, so the operator
@@ -354,28 +352,23 @@ CAMUSDB_IMAGE=camusdb/camusdb:dev CAMUSDB_IMAGE_SKIP_PULL=true make test-e2e
 
 ## Verified
 
-`make test-e2e` runs all of the below against a real kind cluster — 8 specs, ~9 minutes, using the
-published `camusdb/camusdb:0.15.1` image with authentication off.
+`make test-e2e` runs the suite below against a real kind cluster: 8 specs on the published
+`camusdb/camusdb:0.15.2` image. Run it twice, because authentication changes the scale-down path:
+`E2E_AUTH=true make test-e2e` (~6 minutes) and `make test-e2e` (~9 minutes). Both pass 8 of 8.
 
-- Bootstrap to 3 Voters in ~26s with a cert-manager CA issuer, producing exactly **one** StatefulSet
-  revision — no spurious roll
-- SQL round trip through the client Service: create a database and a table, insert, select
+- Bootstrap to 3 Voters with a cert-manager CA issuer in ~21–26s, producing exactly **one**
+  StatefulSet revision (no spurious roll). With authentication, the nodes form the cluster over
+  mutual TLS.
+- SQL round trip through the client Service: create a database and a table, insert, select. With
+  authentication, this includes DDL that a follower forwards to the schema leader.
 - `replicas: 2` and a `partitions` edit both rejected by the API server
-- Scale 3 → 5 in ~49s: stepped one node at a time, existing pods untouched (identical UIDs), both
-  new nodes started with `--join-existing true`
-- Scale 5 → 3 in ~4.6 minutes: one node at a time, each removed by eviction because authentication
-  is off, and the operator never called the leave API
+- Scale 3 → 5 in ~43–47s: one node at a time, existing pods untouched (identical UIDs), both new
+  nodes started with `--join-existing true`
+- Scale 5 → 3, one node at a time:
+  - with authentication, in ~36s: the operator asks each node to leave through the leave API, and
+    no node is evicted;
+  - without authentication, in ~4.6 minutes: each node is evicted, and the operator never calls
+    the leave API.
 - Data written before the scale still readable after 3 → 5 → 3
-- Rolling restart on a `spec.config` change: one pod at a time, 0 container restarts, data readable
-  afterwards
-
-`E2E_AUTH=true make test-e2e` runs the same suite with `spec.auth`. It needs a server with
-node-to-node mutual TLS, so set `CAMUSDB_IMAGE` to one (see "To test against a server built from
-source" above); against `0.15.1` it fails at bootstrap. Against a server built from source, all 8
-specs pass in ~5 minutes:
-
-- Bootstrap to 3 Voters in ~28s, with authentication and mutual TLS between the nodes
-- SQL round trip, including DDL that a follower forwards to the schema leader
-- Scale 3 → 5 in ~42s; the new nodes join over mutual TLS
-- Scale 5 → 3 in ~31s: each node is asked to leave through the leave API, and none is evicted
-- Data written before the scale still readable, and a rolling restart in ~114s
+- Rolling restart on a `spec.config` change in ~114s: one pod at a time, 0 container restarts, data
+  readable afterwards

@@ -101,9 +101,9 @@ func podUIDs() map[string]string {
 	return uids
 }
 
-// authEnabled selects whether the suite turns on CamusDB authentication. It is off by default:
-// authentication needs node-to-node mutual TLS, which the default camusdb/camusdb:0.15.1 image does
-// not have. Turn it on (E2E_AUTH=true) with CAMUSDB_IMAGE set to a server that has it.
+// authEnabled selects whether the suite turns on CamusDB authentication (E2E_AUTH=true). The two
+// settings take different scale-down paths, the leave API with it and eviction without it, so run
+// the suite both ways. Authentication needs CamusDB 0.15.2 or later.
 var authEnabled = envOr("E2E_AUTH", "false") == "true"
 
 // secretValue reads one key of a Secret in the test namespace.

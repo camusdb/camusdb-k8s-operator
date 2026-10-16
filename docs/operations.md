@@ -9,7 +9,7 @@ Create the resource with more nodes than the replication factor. For factor 3, b
 ```yaml
 spec:
   replicas: 4
-  image: camusdb/camusdb:0.15.1
+  image: camusdb/camusdb:0.15.2
   partitions: 16
   auth: {}
   replication:
@@ -24,7 +24,7 @@ spec:
     tolerancePercent: 10
 ```
 
-This is a spec fragment; the required storage and TLS fields still apply. Targets are examples to calibrate against a representative workload. `auth` is required: CamusDB serves engine metrics and the leave call to authenticated callers only, and the API server rejects `autoscaling` without it. Authentication also turns on mutual TLS between the nodes, which needs a CamusDB server newer than 0.15.1 — see [Known gaps](../README.md#known-gaps).
+This is a spec fragment; the required storage and TLS fields still apply. Targets are examples to calibrate against a representative workload. `auth` is required: CamusDB serves engine metrics and the leave call to authenticated callers only, and the API server rejects `autoscaling` without it. Authentication also turns on mutual TLS between the nodes, which needs CamusDB 0.15.2 or later.
 
 A cluster founded at three nodes with factor 3 keeps fully replicated partitions; adding `replication` afterward does not convert them. Before a traffic-driven growth step the controller reads placement, and any fully replicated data partition limits growth to three nodes. An unreadable placement response blocks growth too.
 
@@ -36,7 +36,7 @@ The controller resyncs an autoscaled cluster every 15 seconds and reads each eli
 
 - `targetLogEntriesPerSecond` uses the average per-node delta of `kahuna.kv.write.entries` from `GET /v1/dashboard/metrics`: Raft log entries dispatched by the partitions a node leads. Every kind of write produces entries, and one transaction produces several.
 - `targetQueueDepth` uses the average per-node sum of `raft.executor.client_queue_depth` from the same route: pending client proposals across partition executors.
-- `targetCPUPercent` uses the average per-node `cpu.processCpuPercent` from `GET /v1/admin/stats`: the server process's share of its node over the last minute, 0–100. It is the only signal that sees read load. `camusdb/camusdb:0.15.1` does not serve that route, so with that image this target only ever reports an unreadable signal.
+- `targetCPUPercent` uses the average per-node `cpu.processCpuPercent` from `GET /v1/admin/stats`: the server process's share of its node over the last minute, 0–100. It is the only signal that sees read load. It needs CamusDB 0.15.2 or later: `camusdb/camusdb:0.15.1` does not serve that route, so with that image this target only ever reports an unreadable signal.
 
 At least one target is required. The largest known signal-to-target ratio drives `ceil(current desired size × ratio)` outside the tolerance band; the recommendation is then clamped to the bounds. Four nodes at twice target recommend eight, but a completed scale-up window requests only five. The controller waits for the expected roster and ready pods before considering another traffic step. A new step must earn a new stabilization window.
 

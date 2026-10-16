@@ -229,8 +229,8 @@ type TLSSpec struct {
 //
 // It also turns on mutual TLS between the nodes, because Raft and Kahuna traffic carries no user
 // token: each node presents its keystore as a client certificate, so a keystore from tls.secretRef
-// must allow client authentication. This needs a CamusDB server newer than 0.15.1, which rejects
-// the setting.
+// must allow client authentication. This needs CamusDB 0.15.2 or later; 0.15.1 rejects the
+// setting.
 type AuthSpec struct {
 	// adminSecretRef names a Secret with "username" and "password" keys. The account is created as
 	// the bootstrap superuser when the user catalog is empty, and the operator logs in with it.
@@ -449,7 +449,7 @@ type CamusDBClusterSpec struct {
 	// image moves on its own re-rolls every node on a registry push, and the generated command
 	// line is version-specific: a flag the new server no longer accepts stops the node at
 	// startup. Raise this default deliberately, once the flags are checked against that release.
-	// +kubebuilder:default="camusdb/camusdb:0.15.1"
+	// +kubebuilder:default="camusdb/camusdb:0.15.2"
 	// +optional
 	Image string `json:"image,omitempty"`
 
