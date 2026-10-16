@@ -315,8 +315,9 @@ func (r *CamusDBClusterReconciler) reconcileStatefulSet(ctx context.Context, clu
 	// it here rather than deleting the pod and waiting for the cluster to notice keeps a planned
 	// removal from being indistinguishable from a crash — and turns the wait from the failure
 	// detector's suspicion plus eviction-grace windows into one consensus round.
-	if p.Replicas < currentReplicas {
-		ordinal := currentReplicas - 1
+	// A node the roster does not list has nothing to leave: it never joined, or already left.
+	if ordinal := currentReplicas - 1; p.Replicas < currentReplicas &&
+		(membership == nil || membership.Contains(raftEndpoint(cluster, ordinal))) {
 		left, reason := r.decommission(ctx, cluster, acc, pods, ordinal)
 		if !left {
 			// The node is still a member. Removing its pod now would drop the cluster into the

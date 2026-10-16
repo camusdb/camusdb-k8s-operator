@@ -75,6 +75,15 @@ func buildPlan(cluster *camusdbv1alpha1.CamusDBCluster, currentReplicas int32, b
 	p := plan{Replicas: currentReplicas, Partition: 0}
 
 	if !converged {
+		// The one step that needs no convergence: shrinking away a node the roster does not list,
+		// with every node below it a Voter. It never joined — its pod could not be scheduled or
+		// never started — or it has already left. Removing its pod changes no membership, and
+		// holding here would make a scale-up that cannot finish impossible to undo.
+		if target < currentReplicas && rosterMatches(cluster, m, currentReplicas-1) {
+			p.Replicas = currentReplicas - 1
+			p.Partition = p.Replicas
+			return p
+		}
 		// Hold every node in place. Whatever is wrong — a node still catching up, an eviction
 		// not yet committed, no node reachable — taking another one down cannot help, and if
 		// the cluster is near its quorum floor it would turn a degraded cluster into a dead one.

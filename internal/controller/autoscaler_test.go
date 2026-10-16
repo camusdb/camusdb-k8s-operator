@@ -17,9 +17,11 @@ limitations under the License.
 package controller
 
 import (
+	"strings"
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
@@ -152,6 +154,76 @@ func TestAutoscaleHoldsWhileTheRosterConverges(t *testing.T) {
 	}
 	if d.limited {
 		t.Fatal("a scale in progress is not a limit")
+	}
+}
+
+// A node whose pod can never start must not pin the cluster at a size it never reached: once the
+// traffic no longer needs it, the step that asked for it is given back.
+func TestAutoscaleGivesBackANodeThatNeverJoined(t *testing.T) {
+	spec := autoscaleSpec()
+	prev := &camusdbv1alpha1.AutoscalingStatus{DesiredReplicas: 5}
+	const blocked = "camusdb-4 cannot be scheduled"
+	var d autoscaleDecision
+	for _, off := range []time.Duration{0, 299 * time.Second, 300 * time.Second} {
+		d = decideAutoscale(autoscaleInput{
+			spec: spec, prev: prev, initial: 4, signal: writes(100), joinPending: true,
+			joinBlocked: blocked, now: t0.Add(off),
+		})
+		prev = &d.status
+		if off < 300*time.Second && d.status.DesiredReplicas != 5 {
+			t.Fatalf("gave the node back before the scale-down window elapsed: desired %d", d.status.DesiredReplicas)
+		}
+	}
+	if d.status.DesiredReplicas != 4 {
+		t.Fatalf("desired %d after the window, want 4", d.status.DesiredReplicas)
+	}
+	if !d.limited || d.reason != blocked {
+		t.Fatalf("the stuck pod was not reported: limited=%v reason=%q", d.limited, d.reason)
+	}
+}
+
+func TestAutoscaleDoesNotStackOnANodeThatNeverJoined(t *testing.T) {
+	spec := autoscaleSpec()
+	prev := &camusdbv1alpha1.AutoscalingStatus{DesiredReplicas: 5}
+	var d autoscaleDecision
+	for _, off := range []time.Duration{0, time.Hour} {
+		d = decideAutoscale(autoscaleInput{
+			spec: spec, prev: prev, initial: 4, signal: writes(5000), joinPending: true,
+			joinBlocked: "camusdb-4 cannot be scheduled", now: t0.Add(off),
+		})
+		prev = &d.status
+	}
+	if d.status.DesiredReplicas != 5 || d.status.RecommendedReplicas != 5 {
+		t.Fatalf("stacked a step on one that has not landed: desired %d recommended %d",
+			d.status.DesiredReplicas, d.status.RecommendedReplicas)
+	}
+	if d.status.AboveTargetSince != nil {
+		t.Fatal("a scale-up window accumulated while the previous step had not landed")
+	}
+	if !d.limited {
+		t.Fatal("the stuck pod was not reported")
+	}
+}
+
+func TestJoinBlockedReason(t *testing.T) {
+	starting := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "camusdb-4"}}
+	if r := joinBlockedReason(starting); r != "" {
+		t.Fatalf("a pod that may still be starting was reported as blocked: %q", r)
+	}
+	unschedulable := starting.DeepCopy()
+	unschedulable.Status.Conditions = []corev1.PodCondition{{
+		Type: corev1.PodScheduled, Status: corev1.ConditionFalse,
+		Reason: corev1.PodReasonUnschedulable, Message: "0/1 nodes are available",
+	}}
+	if r := joinBlockedReason(unschedulable); !strings.Contains(r, "cannot be scheduled: 0/1 nodes are available") {
+		t.Fatalf("unschedulable pod reported as %q", r)
+	}
+	crashing := starting.DeepCopy()
+	crashing.Status.ContainerStatuses = []corev1.ContainerStatus{{State: corev1.ContainerState{
+		Waiting: &corev1.ContainerStateWaiting{Reason: waitReasonCrashLoopBackOff, Message: "back-off 40s"},
+	}}}
+	if r := joinBlockedReason(crashing); !strings.Contains(r, "CrashLoopBackOff: back-off 40s") {
+		t.Fatalf("crash-looping pod reported as %q", r)
 	}
 }
 

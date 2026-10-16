@@ -231,6 +231,13 @@ type autoscaleInput struct {
 	// is taken otherwise: the previous one is still in flight, and its catch-up traffic would
 	// distort the signal anyway.
 	converged bool
+	// joinPending is true when the only thing between the cluster and convergence is the newest
+	// node, which is not in the roster at all: the last step up has not landed. No step up is taken
+	// on top of it, but a step down may give it back — otherwise a pod that can never start would
+	// pin the cluster at a size it never reached.
+	joinPending bool
+	// joinBlocked explains why that node's pod cannot make progress on its own, if it cannot.
+	joinBlocked string
 	// growthCeiling is the largest size the cluster may grow to on this pass, independent of the
 	// spec bounds. Zero means no extra ceiling.
 	growthCeiling int32
@@ -276,7 +283,7 @@ func decideAutoscale(in autoscaleInput) autoscaleDecision {
 		return autoscaleDecision{status: st, limited: reason != "", reason: reason}
 	}
 
-	if !in.converged {
+	if !in.converged && !in.joinPending {
 		// Not "limited": a scale in progress is the autoscaler working, not being blocked.
 		return hold("")
 	}
@@ -323,6 +330,10 @@ func decideAutoscale(in autoscaleInput) autoscaleDecision {
 	if rec < current && !allKnown {
 		rec = current
 	}
+	// A step is never stacked on one that has not landed.
+	if in.joinPending {
+		rec = min(rec, current)
+	}
 	rec = min(max(rec, spec.MinReplicas), spec.MaxReplicas)
 	st.RecommendedReplicas = rec
 
@@ -359,6 +370,9 @@ func decideAutoscale(in autoscaleInput) autoscaleDecision {
 		st.AboveTargetSince, st.BelowTargetSince = nil, nil
 	}
 
+	if in.joinPending && in.joinBlocked != "" {
+		return autoscaleDecision{status: st, limited: true, reason: in.joinBlocked}
+	}
 	if rec == spec.MaxReplicas && ratio > 1+tolerance {
 		return autoscaleDecision{status: st, limited: true,
 			reason: fmt.Sprintf("traffic asks for more than maxReplicas (%d)", spec.MaxReplicas)}
@@ -428,21 +442,38 @@ func (r *CamusDBClusterReconciler) reconcileAutoscaling(ctx context.Context, clu
 	}
 	// A nil acc means the access data could not be loaded, and so neither could the roster.
 	converged := acc != nil && bootstrapped && rosterMatches(cluster, membership, current) && readyCount == current
+	// Everything below the newest node is in place and the newest node is not in the roster. A
+	// node still catching up is in the roster as a Learner, so a slow join is not mistaken for this.
+	joinPending := !converged && acc != nil && bootstrapped && current > 1 &&
+		rosterMatches(cluster, membership, current-1) && readyCount == current-1
 
 	in := autoscaleInput{
-		spec:      spec,
-		prev:      cluster.Status.Autoscaling,
-		initial:   initialAutoscaledReplicas(cluster),
-		converged: converged,
-		now:       time.Now(),
+		spec:        spec,
+		prev:        cluster.Status.Autoscaling,
+		initial:     initialAutoscaledReplicas(cluster),
+		converged:   converged,
+		joinPending: joinPending,
+		now:         time.Now(),
+	}
+	if joinPending {
+		newest := podName(cluster, current-1)
+		for i := range pods {
+			if pods[i].Name == newest {
+				in.joinBlocked = joinBlockedReason(&pods[i])
+			}
+		}
 	}
 
 	var measureErr error
-	if converged {
+	if converged || joinPending {
+		// While a join is pending the ready pods are the nodes actually serving, and they are the
+		// ones measured.
 		in.signal, measureErr = r.measure(ctx, cluster, acc, members)
 		if measureErr != nil {
 			log.V(1).Info("Could not read traffic metrics", "error", measureErr)
 		}
+	}
+	if converged {
 		in.growthCeiling, in.ceilingReason = r.growthCeiling(ctx, cluster, acc, members, current)
 	}
 
@@ -468,6 +499,37 @@ func (r *CamusDBClusterReconciler) reconcileAutoscaling(ctx context.Context, clu
 	}
 	setCondition(&cluster.Status, camusdbv1alpha1.ConditionAutoscalingLimited, d.limited,
 		"Limited", "WithinLimits", msg)
+}
+
+// waitReasonCrashLoopBackOff is the kubelet's waiting reason for a container it keeps restarting.
+const waitReasonCrashLoopBackOff = "CrashLoopBackOff"
+
+// blockedWaitReasons are the container waiting reasons that do not clear on their own.
+var blockedWaitReasons = map[string]bool{
+	waitReasonCrashLoopBackOff:   true,
+	"ImagePullBackOff":           true,
+	"ErrImagePull":               true,
+	"InvalidImageName":           true,
+	"CreateContainerConfigError": true,
+}
+
+// joinBlockedReason explains why the pod of a node that has not joined cannot make progress on its
+// own. It returns "" while the pod may still be starting normally, which every new node does for a
+// few seconds: reporting that as a limit would flag every healthy scale-up.
+func joinBlockedReason(pod *corev1.Pod) string {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse && c.Reason == corev1.PodReasonUnschedulable {
+			return fmt.Sprintf("%s has not joined, so no node is added until it does: it cannot be scheduled: %s",
+				pod.Name, c.Message)
+		}
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if w := cs.State.Waiting; w != nil && blockedWaitReasons[w.Reason] {
+			return fmt.Sprintf("%s has not joined, so no node is added until it does: %s: %s",
+				pod.Name, w.Reason, w.Message)
+		}
+	}
+	return ""
 }
 
 // secondsOr converts an optional seconds field, falling back when it is unset.

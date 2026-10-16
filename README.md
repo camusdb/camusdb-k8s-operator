@@ -205,8 +205,10 @@ CPU share over the last minute. Each signal is averaged per node, and a node is 
 configured target needs. The recommendation is the HorizontalPodAutoscaler's rule — current size
 times the worst signal's ratio to its target, with a dead band — but a step is **one node**, taken
 only after the scaling direction has persisted across observations for the whole stabilization
-window and only once the roster has converged on the previous step. Removal goes through the same
-leave-then-delete path as a manual scale-down.
+window and only once the roster has converged on the previous step. A step up whose node never
+joins — its pod cannot be scheduled or keeps failing — blocks further growth but not a step back
+down, so a stuck pod cannot pin the cluster at a size it never reached. Removal goes through the
+same leave-then-delete path as a manual scale-down.
 
 What the autoscaler chose lives in `status.autoscaling` (`desiredReplicas`, `recommendedReplicas`,
 the measured signals and the window timestamps), and `spec.replicas` is ignored after the first

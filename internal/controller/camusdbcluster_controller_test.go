@@ -678,6 +678,93 @@ var _ = Describe("CamusDBCluster Controller", func() {
 			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(3)))
 		})
 
+		// unschedulable and crashLooping are the two ways a new node's pod can fail to join for good.
+		unschedulable := func(pod *corev1.Pod) {
+			pod.Status.Conditions = []corev1.PodCondition{{
+				Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: corev1.PodReasonUnschedulable,
+				Message: "0/1 nodes are available: 1 node(s) had untolerated taint(s)", LastTransitionTime: metav1.Now(),
+			}}
+		}
+		crashLooping := func(pod *corev1.Pod) {
+			pod.Status.PodIP = "10.244.0.5"
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: containerName, State: corev1.ContainerState{
+				Waiting: &corev1.ContainerStateWaiting{Reason: waitReasonCrashLoopBackOff, Message: "back-off 40s restarting failed container"},
+			}}}
+		}
+
+		// stuckAtFive grows the autoscaled cluster from 4 to 5 under load and gives camusdb-4 a pod in
+		// the given failed state, so the step can never land. It returns the load.
+		stuckAtFive := func(fail func(*corev1.Pod)) func(string) *camusdb.Metrics {
+			autoscale()
+			load := steadyLoad(5000)
+			for range 3 {
+				reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 4), metrics: load})
+			}
+			Expect(*getSTS().Spec.Replicas).To(Equal(int32(5)))
+
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: podName(cluster, 4), Namespace: namespace, Labels: selectorLabels(cluster)},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: containerName, Image: cluster.Spec.Image}}},
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			fail(pod)
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+			return load
+		}
+
+		It("gives back a node whose pod can never be scheduled once the load no longer needs it", func() {
+			load := stuckAtFive(unschedulable)
+
+			fake := reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 4), metrics: load})
+			out := getCluster()
+			Expect(out.Status.Autoscaling.DesiredReplicas).To(Equal(int32(5)), "gave the node back under load")
+			Expect(*getSTS().Spec.Replicas).To(Equal(int32(5)))
+			limited := apimeta.FindStatusCondition(out.Status.Conditions, camusdbv1alpha1.ConditionAutoscalingLimited)
+			Expect(limited).NotTo(BeNil())
+			Expect(limited.Status).To(Equal(metav1.ConditionTrue))
+			Expect(limited.Message).To(ContainSubstring("cannot be scheduled: 0/1 nodes are available"))
+
+			// The first idle reading restarts the sampler's clock, so it is not yet a rate.
+			fake.metrics = steadyLoad(0)
+			reconcileUsing(fake)
+			reconcileUsing(fake)
+			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(4)))
+			Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)), "the stuck node was not given back")
+			Expect(fake.leaveCalls).To(BeEmpty(), "asked a node that never joined to leave")
+		})
+
+		It("lets a lowered maxReplicas release a scale-up that cannot finish", func() {
+			load := stuckAtFive(unschedulable)
+
+			obj := getCluster()
+			obj.Spec.Autoscaling.MaxReplicas = 4
+			Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+
+			fake := reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 4), metrics: load})
+			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(4)))
+			Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)), "the bound was applied to status but not to the StatefulSet")
+			Expect(fake.leaveCalls).To(BeEmpty(), "asked a node that never joined to leave")
+		})
+
+		// A crash-looping pod has an IP, so a leave call would reach it — and fail, holding the
+		// scale-down forever. A node that never joined has nothing to leave.
+		It("releases a crash-looping node that never joined without asking it to leave", func() {
+			load := stuckAtFive(crashLooping)
+			refused := fmt.Errorf("dial tcp 10.244.0.5:7141: connect: connection refused")
+
+			reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 4), metrics: load, leaveErr: refused})
+			limited := apimeta.FindStatusCondition(getCluster().Status.Conditions, camusdbv1alpha1.ConditionAutoscalingLimited)
+			Expect(limited).NotTo(BeNil())
+			Expect(limited.Message).To(ContainSubstring("CrashLoopBackOff: back-off 40s"))
+
+			obj := getCluster()
+			obj.Spec.Autoscaling.MaxReplicas = 4
+			Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+			fake := reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 4), metrics: load, leaveErr: refused})
+			Expect(fake.leaveCalls).To(BeEmpty(), "asked a node that never joined to leave")
+			Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)))
+		})
+
 		It("does not resize the StatefulSet when the new size could not be recorded", func() {
 			autoscale()
 			idle := steadyLoad(0)
