@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- camusdb_v1alpha1_camusdbcluster.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

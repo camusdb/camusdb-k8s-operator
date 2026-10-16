@@ -1,0 +1,27 @@
+apiVersion: v2
+name: camusdb-operator
+description: Kubernetes operator for CamusDB — a distributed SQL database built on Raft consensus
+type: application
+# version is the chart version; appVersion tracks the operator release the default image points at.
+#
+# Both are overridden at package time from the release tag. They are kept accurate here anyway so
+# that `helm install ./charts/camusdb-operator` from a source checkout resolves a real image —
+# appVersion carries the v prefix because that is how the images are tagged.
+version: 0.1.1
+appVersion: "v0.1.1"
+home: https://github.com/camusdb/camusdb-k8s-operator
+sources:
+  - https://github.com/camusdb/camusdb-k8s-operator
+  - https://github.com/camusdb/camusdb
+keywords:
+  - camusdb
+  - raft
+  - sql
+  - database
+  - operator
+maintainers:
+  - name: camusdb
+annotations:
+  # cert-manager is optional: it is needed only by clusters that set spec.tls.certManager rather
+  # than supplying their own keystore Secret.
+  artifacthub.io/prerelease: "true"

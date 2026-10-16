@@ -1,0 +1,36 @@
+apiVersion: camusdb.io/v1alpha1
+kind: CamusDBCluster
+metadata:
+  labels:
+    app.kubernetes.io/name: camusdb-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: camusdb
+spec:
+  # 3 tolerates one node failure. 2 is rejected (a quorum of 2 tolerates none), and 1 cannot later
+  # be grown into a larger cluster.
+  replicas: 3
+  image: camusdb/camusdb:0.15.1
+  imagePullPolicy: IfNotPresent
+  # Fixed at bootstrap: the partition map is built once and changing the count later would
+  # orphan it, so the CRD rejects the edit.
+  partitions: 3
+  # auth: {} turns on CamusDB authentication, which the operator needs to ask a node to leave the
+  # cluster before removing its pod and to read traffic for autoscaling. It is left off here
+  # because it needs node-to-node mutual TLS, which this 0.15.1 image does not have. See
+  # "Known gaps" in the README.
+  storage:
+    data:
+      size: 5Gi
+  tls:
+    # A cluster always needs a keystore: nodes reach each other over https:// and always verify
+    # the peer's certificate. The Secret holds a PKCS#12 keystore without a password and the CA
+    # that signed it.
+    secretRef:
+      name: camusdb-tls
+    keystoreKey: certificate.pfx
+    caKey: ca.crt
+  logLevel: Information
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi

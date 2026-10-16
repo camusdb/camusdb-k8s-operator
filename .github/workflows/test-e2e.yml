@@ -1,0 +1,56 @@
+name: E2E Tests
+
+on:
+  push:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  test-e2e:
+    permissions:
+      contents: read
+    name: Run on Ubuntu
+    runs-on: ubuntu-latest
+    # The suite walks a real cluster through bootstrap, a scale out and back, and a rolling
+    # restart. Each membership change waits out SWIM's suspicion and eviction-grace windows, so
+    # the wall-clock floor is minutes and no tuning removes it.
+    timeout-minutes: 45
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install the latest version of kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Verify kind installation
+        run: kind version
+
+      - name: Running Test e2e
+        run: |
+          go mod tidy
+          make test-e2e
+
+      # The suite tears its namespace down on success, so this only ever runs against a cluster
+      # that is still in whatever state broke it.
+      - name: Dump cluster state on failure
+        if: failure()
+        run: |
+          kubectl get camusdbclusters -A -o yaml || true
+          kubectl -n camusdb-e2e get pods,sts,svc,cm,pvc || true
+          kubectl -n camusdb-e2e describe pods || true
+          for p in $(kubectl -n camusdb-e2e get pods -o name 2>/dev/null); do
+            echo "===== $p ====="
+            kubectl -n camusdb-e2e logs "$p" --tail=200 || true
+          done
+          kubectl -n camusdb-operator-system logs deployment/camusdb-operator-controller-manager --tail=300 || true
