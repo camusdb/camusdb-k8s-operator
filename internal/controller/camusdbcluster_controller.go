@@ -72,7 +72,12 @@ const maxConcurrentReconciles = 4
 // CamusDBClusterReconciler reconciles a CamusDBCluster object
 type CamusDBClusterReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	// APIReader reads the CamusDBCluster straight from the API server. The cached copy can lag
+	// the status this reconciler wrote on its previous pass, and that status holds the size the
+	// autoscaler chose: a pass acting on the older size would resize the StatefulSet back to it,
+	// and only its own status write would be rejected — after the damage. Nil reads through Client.
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
 	// CamusDB reads the committed Raft roster from the cluster itself. Every membership-changing
 	// step is gated on it rather than on Kubernetes state, because the roster is the
 	// authoritative record of who is a member: a Running pod need not be one, and a roster entry
@@ -100,7 +105,7 @@ func (r *CamusDBClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	log := logf.FromContext(ctx)
 
 	cluster := &camusdbv1alpha1.CamusDBCluster{}
-	if err := r.Get(ctx, req.NamespacedName, cluster); err != nil {
+	if err := r.clusterReader().Get(ctx, req.NamespacedName, cluster); err != nil {
 		if apierrors.IsNotFound(err) {
 			r.traffic.forget(req.NamespacedName)
 		}
@@ -175,6 +180,17 @@ func (r *CamusDBClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// everything below reads the target through desiredReplicas, which consults the state set here.
 	r.reconcileAutoscaling(ctx, cluster, acc, bootstrapped, membership, pods)
 
+	// A new size is recorded before anything acts on it. Resizing first and failing the status
+	// write afterwards leaves the old size stored, and the next pass would walk the StatefulSet
+	// back to it — re-adding a node that has just left the cluster.
+	if as := cluster.Status.Autoscaling; as != nil &&
+		(persisted.Autoscaling == nil || as.DesiredReplicas != persisted.Autoscaling.DesiredReplicas) {
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("recording the autoscaler's decision: %w", err)
+		}
+		persisted = cluster.Status.DeepCopy()
+	}
+
 	sts, err := r.reconcileStatefulSet(ctx, cluster, acc, bootstrapped, membership, pods, rc, keystore)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconciling stateful set: %w", err)
@@ -189,6 +205,14 @@ func (r *CamusDBClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		"ready", cluster.Status.ReadyReplicas, "voters", cluster.Status.Voters,
 		"desired", desiredReplicas(cluster))
 	return result, nil
+}
+
+// clusterReader is where the CamusDBCluster itself is read from; see APIReader.
+func (r *CamusDBClusterReconciler) clusterReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 func (r *CamusDBClusterReconciler) reconcileServices(ctx context.Context, cluster *camusdbv1alpha1.CamusDBCluster) error {

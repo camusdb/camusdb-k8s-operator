@@ -41,6 +41,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	camusdbv1alpha1 "github.com/camusdb/k8s-operator/api/v1alpha1"
@@ -121,6 +122,47 @@ func (f *fakeCamusDB) Leave(_ context.Context, t camusdb.Target) (*camusdb.Leave
 
 // testCA is a real self-signed CA certificate in PEM. The operator parses the CA it trusts, so a
 // placeholder would fail before any behaviour under test is reached.
+// staleClusterClient stands in for the manager's informer cache lagging the API server: Gets of
+// the CamusDBCluster return a snapshot taken before the last status write, while everything else,
+// writes included, goes to the real API server.
+type staleClusterClient struct {
+	client.Client
+	stale *camusdbv1alpha1.CamusDBCluster
+}
+
+func (c *staleClusterClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if out, ok := obj.(*camusdbv1alpha1.CamusDBCluster); ok && key.Name == c.stale.Name {
+		c.stale.DeepCopyInto(out)
+		return nil
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+// conflictOnceClient rejects the first status write with a conflict, as the API server does when
+// someone else changed the object between the reconciler's read and its write.
+type conflictOnceClient struct {
+	client.Client
+	failed bool
+}
+
+func (c *conflictOnceClient) Status() client.SubResourceWriter {
+	return &conflictOnceStatus{SubResourceWriter: c.Client.Status(), parent: c}
+}
+
+type conflictOnceStatus struct {
+	client.SubResourceWriter
+	parent *conflictOnceClient
+}
+
+func (s *conflictOnceStatus) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	if !s.parent.failed {
+		s.parent.failed = true
+		return apierrors.NewConflict(camusdbv1alpha1.GroupVersion.WithResource("camusdbclusters").GroupResource(),
+			obj.GetName(), fmt.Errorf("the object has been modified"))
+	}
+	return s.SubResourceWriter.Update(ctx, obj, opts...)
+}
+
 var testCA = sync.OnceValue(func() []byte {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -609,6 +651,57 @@ var _ = Describe("CamusDBCluster Controller", func() {
 			reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 3), metrics: idle})
 			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(3)),
 				"scaled below minReplicas")
+		})
+
+		// The pass right after a step is triggered by the StatefulSet and pod changes that step
+		// caused, and runs before the cache has seen the step's own status write.
+		It("does not undo a step down when the cached cluster predates it", func() {
+			autoscale()
+			idle := steadyLoad(0)
+
+			reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 4), metrics: idle})
+			reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 4), metrics: idle})
+			beforeStep := getCluster()
+			reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 4), metrics: idle})
+			Expect(*getSTS().Spec.Replicas).To(Equal(int32(3)))
+
+			reconciler.APIReader = k8sClient
+			reconciler.Client = &staleClusterClient{Client: k8sClient, stale: beforeStep}
+			// The departed node is out of the roster; its pod has not terminated yet. A pass acting on
+			// the stale copy fails its status write, but only after resizing, so the error is not
+			// what this asserts on.
+			reconciler.CamusDB = &fakeCamusDB{membership: rosterOf(cluster, 3), metrics: idle}
+			_, _ = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+
+			Expect(*getSTS().Spec.Replicas).To(Equal(int32(3)),
+				"a cached status from before the step grew the StatefulSet back")
+			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(3)))
+		})
+
+		It("does not resize the StatefulSet when the new size could not be recorded", func() {
+			autoscale()
+			idle := steadyLoad(0)
+
+			reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 4), metrics: idle})
+			reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 4), metrics: idle})
+
+			reconciler.Client = &conflictOnceClient{Client: k8sClient}
+			fake := &fakeCamusDB{membership: rosterOf(cluster, 4), metrics: idle}
+			reconciler.CamusDB = fake
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+			Expect(apierrors.IsConflict(err)).To(BeTrue(), "%v", err)
+
+			// Stored status still says 4. Had the step gone ahead, the next pass would read 4 and
+			// put the departed node back.
+			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(4)))
+			Expect(fake.leaveCalls).To(BeEmpty(), "a node was asked to leave for a size that was never recorded")
+			Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)))
+
+			// The retry decides again and goes through.
+			fake = reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 4), metrics: idle})
+			Expect(fake.leaveCalls).To(HaveLen(1))
+			Expect(*getSTS().Spec.Replicas).To(Equal(int32(3)))
+			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(3)))
 		})
 
 		It("does not grow a fully replicated cluster past the replication cap", func() {

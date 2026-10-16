@@ -191,8 +191,9 @@ func main() {
 	}
 
 	if err := (&controller.CamusDBClusterReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
 		// Two bounds, because the two calls differ. A status read stays short, so it never
 		// wedges a reconcile; an unreachable node is reported as an unknown roster, not as an
 		// error. A leave gets the server's own bound, because the server holds that request
