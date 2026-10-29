@@ -168,6 +168,28 @@ func (r *CamusDBClusterReconciler) readMembership(ctx context.Context, cluster *
 	return nil, lastErr
 }
 
+// readPlacement asks a ready node for the committed replica placement. Any node can answer, but
+// only a ready one has applied the partition map, so a pod that is still starting is not asked.
+func (r *CamusDBClusterReconciler) readPlacement(ctx context.Context, cluster *camusdbv1alpha1.CamusDBCluster, acc *nodeAccess, pods []corev1.Pod) (*camusdb.Placement, error) {
+	var lastErr error
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Status.PodIP == "" || pod.DeletionTimestamp != nil || !podIsReady(pod) {
+			continue
+		}
+		p, err := r.CamusDB.Placement(ctx, acc.target(cluster, pod))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return p, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no ready pod to read placement from")
+	}
+	return nil, lastErr
+}
+
 // buildMemberStatus joins the committed roster to the pods serving it.
 //
 // The join is the interesting part: a roster entry with no pod is a member the cluster still

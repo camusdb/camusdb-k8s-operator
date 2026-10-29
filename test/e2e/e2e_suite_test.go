@@ -41,7 +41,7 @@ var (
 	// It is a pinned published tag rather than :latest so a green run stays green: an upstream
 	// image push must not turn an unrelated pull request red. Override it to test a locally built
 	// server, or bump it deliberately to pick up a new release.
-	serverImage = envOr("CAMUSDB_IMAGE", "camusdb/camusdb:0.15.2")
+	serverImage = envOr("CAMUSDB_IMAGE", "camusdb/camusdb:0.16.3")
 )
 
 // envOr reads an environment variable with a fallback.

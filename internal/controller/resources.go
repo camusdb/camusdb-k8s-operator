@@ -196,10 +196,11 @@ func containerEnv(cluster *camusdbv1alpha1.CamusDBCluster) []corev1.EnvVar {
 	return append(env, cluster.Spec.Env...)
 }
 
-// podVolumes builds the non-PVC volumes: the generated configuration, the keystore and the scratch
-// directory the CA bundle is assembled in.
+// podVolumes builds the non-template volumes: the generated configuration, the keystore, the
+// scratch directory the CA bundle is assembled in and, with backups on, the shared backup claim and
+// the manifest-signing key.
 func podVolumes(cluster *camusdbv1alpha1.CamusDBCluster) []corev1.Volume {
-	return []corev1.Volume{{
+	vols := []corev1.Volume{{
 		Name: configVolumeName,
 		VolumeSource: corev1.VolumeSource{
 			ConfigMap: &corev1.ConfigMapVolumeSource{
@@ -221,6 +222,28 @@ func podVolumes(cluster *camusdbv1alpha1.CamusDBCluster) []corev1.Volume {
 		Name:         trustVolumeName,
 		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 	}}
+
+	if cluster.Spec.Backup != nil {
+		mac := backupMACKeyRef(cluster)
+		vols = append(vols, corev1.Volume{
+			Name: backupVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: backupClaimName(cluster)},
+			},
+		}, corev1.Volume{
+			Name: backupMACVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: mac.Name,
+					Items:      []corev1.KeyToPath{{Key: mac.Key, Path: backupMACFileName}},
+					// Readable by any user, for the same reason as the keystore: the pod may run as a
+					// non-root UID that the Secret's default owner does not match.
+					DefaultMode: ptr.To(int32(0o444)),
+				},
+			},
+		})
+	}
+	return vols
 }
 
 // podVolumeMounts mirrors podVolumes plus the persistent claims.
@@ -236,7 +259,32 @@ func podVolumeMounts(cluster *camusdbv1alpha1.CamusDBCluster) []corev1.VolumeMou
 		// WAL volume lands on top of the directory the data volume provides.
 		mounts = append(mounts, corev1.VolumeMount{Name: walVolumeName, MountPath: walPath})
 	}
+	if cluster.Spec.Backup != nil {
+		mounts = append(mounts,
+			corev1.VolumeMount{Name: backupVolumeName, MountPath: backupMountPath},
+			corev1.VolumeMount{Name: backupMACVolumeName, MountPath: backupMACMountPath, ReadOnly: true},
+		)
+	}
 	return mounts
+}
+
+// desiredBackupClaim builds the claim the operator creates from spec.backup.volume.claim.
+// ReadWriteMany is the default because every node mounts it at once. A single-node cluster gets
+// ReadWriteOnce instead: nothing shares its claim, and most StorageClasses, block storage and
+// Kind's local-path among them, cannot provision ReadWriteMany at all.
+func desiredBackupClaim(cluster *camusdbv1alpha1.CamusDBCluster) *corev1.PersistentVolumeClaim {
+	spec := *cluster.Spec.Backup.Volume.Claim
+	if len(spec.AccessModes) == 0 {
+		mode := corev1.ReadWriteMany
+		if singleNode(cluster) {
+			mode = corev1.ReadWriteOnce
+		}
+		spec.AccessModes = []corev1.PersistentVolumeAccessMode{mode}
+	}
+	pvc := volumeClaim(backupClaimName(cluster), spec)
+	pvc.Namespace = cluster.Namespace
+	pvc.Labels = podLabels(cluster)
+	return &pvc
 }
 
 // desiredStatefulSet builds the StatefulSet backing the cluster.

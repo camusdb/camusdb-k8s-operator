@@ -37,6 +37,13 @@ const serverDLLPath = "/app/CamusDB.dll"
 // systemCABundle is the Debian trust store of the .NET runtime images CamusDB is built on.
 const systemCABundle = "/etc/ssl/certs/ca-certificates.crt"
 
+// Placement rebalancer pacing written with a replication factor; see generatedConfig.
+const (
+	rebalancerConcurrentTransfers = 4
+	rebalancerMovesPerPass        = 8
+	rebalancerDeadband            = 0
+)
+
 // shellQuote renders s as a single-quoted POSIX shell word.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
@@ -88,6 +95,34 @@ func generatedConfig(cluster *camusdbv1alpha1.CamusDBCluster) map[string]any {
 		// factor without the rebalancer means every scale-up adds a node that holds no data.
 		kahuna["replication_factor"] = rep.Factor
 		kahuna["enable_placement_rebalancer"] = true
+		// The server's pacing is too slow for a scale-up. At its defaults a node added to a cluster
+		// took a quarter of an hour to receive a handful of replicas and then stayed under-filled for
+		// good, because every full node was within the deadband of the even share. spec.config wins
+		// over these, for a cluster where the backfill competes too hard with client traffic.
+		kahuna["max_concurrent_replica_transfers"] = rebalancerConcurrentTransfers
+		kahuna["max_replica_moves_per_pass"] = rebalancerMovesPerPass
+		kahuna["replica_count_deadband"] = rebalancerDeadband
+	}
+
+	if b := cluster.Spec.Backup; b != nil {
+		kahuna["backup_dir"] = backupPath(cluster)
+		kahuna["backup_cluster_id"] = backupClusterID(cluster)
+		kahuna["backup_mac_key_file"] = backupMACKeyPath
+		// The periodic GC pass is off because every node shares one backup directory. Its orphan
+		// sweep treats artifacts that have no manifest yet as left over from a crash, and a backup in
+		// progress on another node looks exactly like that: a sweep from any other node would delete
+		// it. With the pass off, GC runs only inline after each backup, on the node that took it, and
+		// the operator never runs two backups of one cluster at once.
+		kahuna["backup_gc_interval_seconds"] = 0
+		if r := b.Retention; r != nil {
+			setInt(kahuna, "backup_retention_max_chains", r.MaxChains)
+			if r.MaxAge != nil {
+				kahuna["backup_retention_max_age_seconds"] = int64(r.MaxAge.Seconds())
+			}
+			if r.MaxBytes != nil {
+				kahuna["backup_retention_max_bytes"] = r.MaxBytes.Value()
+			}
+		}
 	}
 
 	if r := cluster.Spec.Raft; r != nil {

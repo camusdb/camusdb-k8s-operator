@@ -35,12 +35,13 @@ camusdb   3                      3       3        Running   12m
 
 | | |
 |---|---|
-| **Provisions** | Headless peer Service, client Service, per-node PVCs, ConfigMap (startup script and `config.yml`), PodDisruptionBudget, StatefulSet, and — when asked — the cert-manager Certificate, the keystore derived from it, and the authentication Secrets. |
+| **Provisions** | Headless peer Service, client Service, per-node PVCs, ConfigMap (startup script and `config.yml`), PodDisruptionBudget, StatefulSet, and — when asked — the cert-manager Certificate, the keystore derived from it, the authentication Secrets, and the shared backup claim and its signing key. |
 | **Bootstraps** | Brings up all founding nodes at once so they can form their first quorum, and reports `Running` only when the committed roster carries every node as a Voter. |
-| **Scales** | One node at a time, in both directions, each step gated on the roster — never on what Kubernetes merely believes. With authentication on, departing nodes are decommissioned through the cluster's leave API before their pods are removed. |
+| **Scales** | One node at a time, in both directions, each step gated on the roster and on the replica placement having settled — never on what Kubernetes merely believes. With authentication on, departing nodes are decommissioned through the cluster's leave API before their pods are removed. |
 | **Autoscales** | Optional. Adds and removes nodes with load — Raft log entry rate, client queue depth, or CPU — between a minimum and a maximum, one node at a time, and never grows a cluster in a way that would put more than 3 copies on any data partition. |
 | **Upgrades** | Rolling restarts one node at a time, held back automatically whenever the roster is not converged or unreadable. A renewed certificate rolls the nodes onto it the same way. |
-| **Reports** | `status.members` mirrors the committed roster joined to the pods serving it, plus `Available` / `Progressing` / `RosterConverged` / `KeystoreReady` conditions. |
+| **Backs up** | Optional. Coordinated full backups and incrementals on cron schedules, to one volume that every node shares, with retention. |
+| **Reports** | `status.members` mirrors the committed roster joined to the pods serving it, `status.currentImage` names the image every node runs, plus `Available` / `Progressing` / `RosterConverged` / `KeystoreReady` / `BackupFailing` / `BackupVolumeReady` conditions. |
 
 ## Design decisions worth knowing
 
@@ -92,6 +93,17 @@ replaced the moment it appeared — and a rolling update waits for each replaced
 which no founding node can do alone. The operator reports `Pending` and `KeystoreReady=False`
 until the keystore is there.
 
+**A step is complete when the data has followed it, not when the roster has.** Before any further
+membership change the operator reads `GET /v1/cluster/placement` and holds while a replica is still
+in a transitional role or still assigned to a node that left. A scale-down that went ahead during
+those repairs would take a second copy from partitions that have already lost one. An unreadable
+placement holds a scale step, like an unreadable roster. A rolling update is not held for it.
+
+**`status.currentImage` moves only when every node runs the image.** It changes to `spec.image` once
+every pod of the StatefulSet runs that image and is ready. During an image rollout, and when a
+rollout is stuck, it keeps the previous image, and `Progressing` stays true and names the image
+being rolled out.
+
 **Liveness uses `/ping`, not `/v1/cluster/health` and not `/`.** The health route returns 503 for a
 node that is up but not yet a serving member — a state every node passes through on restart, and
 one an evicted node can sit in. Restarting the process fixes neither. `/` is the dashboard, which
@@ -142,8 +154,9 @@ Changing configuration rolls the cluster; changing `replicas` does not.
 
 ## Authentication
 
-> **Needs CamusDB 0.15.2 or later**, the default image. Authentication turns on node-to-node mutual
-> TLS (`raft_mutual_tls_enabled`), which 0.15.1 does not have and rejects at startup.
+> **Needs CamusDB 0.15.2 or later.** The default image, 0.16.3, has it. Authentication turns on
+> node-to-node mutual TLS (`raft_mutual_tls_enabled`), which 0.15.1 does not have and rejects at
+> startup.
 
 ```yaml
 spec:
@@ -175,7 +188,7 @@ restarts it node by node, and until every node has restarted the cluster still s
 unauthenticated requests on the nodes not yet restarted.
 
 Without authentication the operator still bootstraps, scales and upgrades the cluster: the roster,
-health and placement routes answer anyone. Graceful decommissioning and autoscaling need it.
+health and placement routes answer anyone. Graceful decommissioning, autoscaling and backups need it.
 
 ## Autoscaling
 
@@ -205,10 +218,15 @@ CPU share over the last minute. Each signal is averaged per node, and a node is 
 configured target needs. The recommendation is the HorizontalPodAutoscaler's rule — current size
 times the worst signal's ratio to its target, with a dead band — but a step is **one node**, taken
 only after the scaling direction has persisted across observations for the whole stabilization
-window and only once the roster has converged on the previous step. A step up whose node never
-joins — its pod cannot be scheduled or keeps failing — blocks further growth but not a step back
-down, so a stuck pod cannot pin the cluster at a size it never reached. Removal goes through the
-same leave-then-delete path as a manual scale-down.
+window and only once the previous step is complete. Complete means more than the roster having
+converged: the operator also reads `GET /v1/cluster/placement` and waits until no replica move is in
+flight, no replica is left on a node that departed, and every node carries a share of the data
+partitions. The share is waited for at most five minutes after the step, because the server's
+planner stops at its own notion of even and a cluster with fewer placed replicas than nodes leaves
+one empty for good; the two other conditions are waited for as long as they hold. A step up whose
+node never joins — its pod cannot be scheduled or keeps failing — blocks further growth but not a
+step back down, so a stuck pod cannot pin the cluster at a size it never reached. Removal goes
+through the same leave-then-delete path as a manual scale-down.
 
 What the autoscaler chose lives in `status.autoscaling` (`desiredReplicas`, `recommendedReplicas`,
 the measured signals and the window timestamps), and `spec.replicas` is ignored after the first
@@ -218,13 +236,22 @@ pass. Removing `spec.autoscaling` hands the count back to `spec.replicas`.
 so a node added is one more copy of all data and one more voter on every write: more cost, no more
 write capacity. With `factor: 3` the operator writes `kahuna.replication_factor: 3` and
 `kahuna.enable_placement_rebalancer: true`; the rebalancer is what gives a newly added node any data
-at all.
+at all. It also raises the rebalancer's pacing (`kahuna.max_concurrent_replica_transfers: 4`,
+`kahuna.max_replica_moves_per_pass: 8`, `kahuna.replica_count_deadband: 0`): at the server defaults a
+node added by a scale-up took a quarter of an hour to receive a handful of replicas and then stayed
+under-filled for good, because every full node was within the deadband of the even share. Override
+any of them through `spec.config` if backfill competes too hard with client traffic.
 
-**Create the cluster with more nodes than the factor.** The server places a partition only if it is
-created while the cluster has more nodes than the factor, and it never converts a fully replicated
-partition later. A cluster founded at 3 nodes with factor 3 therefore stays fully replicated
-forever. The operator checks `GET /v1/cluster/placement` before every scale-up and refuses to grow
-such a cluster past 3 nodes, reporting why in the `AutoscalingLimited` condition.
+**Any founding size works on CamusDB 0.16.0 and later, and so does turning the factor on later.** A
+partition created while the cluster has no more nodes than the factor starts fully replicated (no
+replica set), and so does every partition of a cluster that had no factor. CamusDB 0.16.0 and later
+(Kahuna 1.12.8 and later) convert such a partition: the rebalancer first commits every current voter
+as the replica set, which moves no data, and then trims that set down to the factor one replica at a
+time. Older servers never convert one. The operator checks `GET /v1/cluster/placement` before every
+scale-up and does not grow past 3 nodes while any data partition is still fully replicated,
+reporting why in the `AutoscalingLimited` condition. On 0.16.0 and later that limit clears by itself
+a few rebalancer passes after the cluster starts with the factor; on an older server it holds until
+the cluster is recreated with more nodes than the factor.
 
 **Signals and unknowns.** The autoscaler holds — and says so in `AutoscalingLimited` — when any
 ready node's signals cannot be read, and it never scales down on a partial view, since the missing
@@ -232,6 +259,124 @@ node may be the leader carrying the load. Log entries are not statements: one tr
 several (its prepare, decision and settle), so calibrate the target against a representative
 workload. CPU is the only signal that sees read load. `targetCPUPercent` needs a server that serves
 `/v1/admin/stats`, which CamusDB 0.15.2 does and 0.15.1 does not.
+
+## Backups
+
+> **Needs `spec.auth`.** Without authentication CamusDB accepts backup calls from loopback callers
+> only, so the API server rejects `backup` without `auth`.
+
+```yaml
+spec:
+  auth: {}
+  backup:
+    schedule: "0 2 * * *"            # full backups, cron, UTC unless CRON_TZ=<zone> is given
+    incrementalSchedule: "*/15 * * * *"  # optional
+    volume:
+      claim:                         # or claimName: <existing ReadWriteMany claim>
+        size: 100Gi
+        storageClassName: filestore  # any class that supports ReadWriteMany
+    retention:
+      maxChains: 7
+      # maxAge: 168h
+      # maxBytes: 500Gi
+    # clusterID: prod/camusdb        # defaults to <namespace>/<name>
+    # macKeySecretRef: {name: my-key, key: key}
+    # timeout: 1h
+    # suspend: false
+```
+
+Leave `backup` out and the cluster takes no backups. With it, every node mounts one shared volume
+at `/backup` and runs with `kahuna.backup_dir: /backup/<name>`, so all nodes read one backup
+catalog. A shared catalog is what lets a node find an incremental's parent and list every backup; a
+volume per node would give each node only the backups it took itself.
+
+The operator drives the schedule. A full backup is a coordinated backup
+(`POST /v1/backups/coordinated`): the server takes it at one cut time that is the same for every
+partition. Only the node that leads the backup meta partition accepts it, so the operator sends it
+to each ready node in turn until one does. An incremental (`POST /v1/backups/incremental`) adds the
+log written since the latest backup. The first full backup runs as soon as the cluster is steady
+after `backup` is added; after that each kind runs on its own schedule, and missed runs collapse
+into one, as with a CronJob. The operator calls the nodes over HTTPS as the admin account, which is
+the bootstrap superuser that the backup routes require.
+
+- **Backups run in the background.** A full backup can take many minutes, so the reconcile starts it
+  and collects the result on a later pass; scaling and rollouts are not held for it.
+- **A backup waits for a steady cluster:** bootstrap complete, roster converged, and every pod ready
+  on the current configuration and image. Turning backups on rolls the cluster, and the first
+  backup waits for the rollout to finish.
+- **Status.** `status.backup` records the last backup id and type, the schedule anchors, and the
+  failures. The `BackupFailing` condition is true while the latest attempt failed. A failed backup
+  stays due and is retried after a backoff (1 minute, doubling to 30). If an incremental's parent is
+  gone from the catalog (`CADB0705`), a new chain starts with a full backup at once.
+- **A steady cluster can still have no backup coordinator.** Right after bootstrap no node leads the
+  meta partition yet, so every node can refuse the first backup (`CADB070E`, not the coordinator).
+  Leadership that moves during the backup (`CADB070A`) and a topology change during the backup
+  (`CADB070D`) also clear on retry. When every refusal is of these kinds, the backup is retried
+  after 15 seconds and is not counted as a failure: `BackupFailing` stays false with reason
+  `BackupWaiting`, and `status.backup.unclaimedSince` shows since when. Only if no node takes it for
+  5 minutes is it counted as a failure, with the usual backoff.
+- **Retention** maps to `kahuna.backup_retention_*`. The server deletes whole chains and always
+  keeps the newest one. The periodic GC pass is turned off (`kahuna.backup_gc_interval_seconds: 0`):
+  its orphan sweep would delete a backup that another node has in progress on the shared volume. GC
+  still runs after each backup, on the node that took it.
+- **The volume must be ReadWriteMany when the cluster has more than one node.** The operator's
+  `<name>-backup` claim asks for ReadWriteMany, or for ReadWriteOnce on a single-node cluster, where
+  nothing shares it. Most default StorageClasses are block storage and cannot give ReadWriteMany:
+  Kind's `local-path`, EBS, Persistent Disk and Azure Disk among them. Use a file-storage class
+  (NFS, Filestore, EFS, Azure Files, CephFS) or name your own claim in `claimName`. Every pod mounts
+  the claim, so while it is unbound no pod starts and the cluster stays in bootstrap. The
+  `BackupVolumeReady` condition then names the cause, for example the provisioner's
+  `ProvisioningFailed` event. Until the claim binds, the operator replaces it when
+  `volume.claim` changes, so a corrected `storageClassName` takes effect without a manual delete.
+  After it binds, the operator does not change it.
+- **The claim and the signing key outlive the cluster.** Neither the `<name>-backup` claim nor the
+  generated `<name>-backup-mac` Secret has an owner reference, so deleting the CamusDBCluster or
+  removing `backup` keeps both. The server refuses to restore or seed from a signed backup without
+  its key.
+
+**Under a replication factor, backups need CamusDB 0.16.0 or later.** When `replication.factor` is
+less than the most nodes the cluster can have (`autoscaling.maxReplicas`, or `replicas`), no node
+hosts every partition. CamusDB 0.16.0 and later compose the coordinated backup from each node's
+share of the partitions, captured at one cut, so the backup covers every partition. An older
+server's backup holds only the partitions the node taking it hosts, and restore and seeding refuse
+it. So on such a cluster the operator takes no backup when `image` has a release tag before 0.16.0:
+`BackupFailing` is `True` with reason `UnsupportedImage`. The operator cannot read the version of an
+image without a release tag (`latest`, a branch build, a digest alone), and takes backups with it. A
+backup also waits until every pod runs the current `image`, because during an image rollout an older
+node cannot capture its share.
+
+**On a single-node Kind cluster,** whose only class is `local-path`, a hostPath PersistentVolume
+gives a working ReadWriteMany claim. It is correct there only because every pod runs on the one
+node:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: camusdb-backup
+spec:
+  capacity: {storage: 5Gi}
+  accessModes: [ReadWriteMany]
+  storageClassName: manual
+  persistentVolumeReclaimPolicy: Retain
+  hostPath: {path: /var/local/camusdb-backup, type: DirectoryOrCreate}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: camusdb-backup
+  namespace: camusdb
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: manual
+  volumeName: camusdb-backup
+  resources: {requests: {storage: 5Gi}}
+```
+
+Then set `spec.backup.volume.claimName: camusdb-backup`.
+
+**Restore is manual for now.** See the
+[server backup guide](https://github.com/camusdb/camusdb/blob/main/docs/backups-and-point-in-time-recovery.md).
 
 ## TLS
 
@@ -283,7 +428,7 @@ content changes rolls the nodes the same way, at the next resync.
 
 ## Server version
 
-`spec.image` defaults to an exact tag, `camusdb/camusdb:0.15.2`, rather than to `latest`. A floating
+`spec.image` defaults to an exact tag, `camusdb/camusdb:0.16.3`, rather than to `latest`. A floating
 tag re-rolls a running cluster on a registry push, and the generated command line is
 version-specific: CamusDB's parser rejects an option it does not define and the node exits. Raise
 the tag deliberately, after checking the flags against that release.
@@ -336,10 +481,16 @@ CAMUSDB_IMAGE=camusdb/camusdb:dev CAMUSDB_IMAGE_SKIP_PULL=true make test-e2e
   leaves it off. Raft and gRPC traffic is encrypted; restrict pod-to-pod traffic with a
   NetworkPolicy if the node secret matters to you.
 - **Without authentication, scale-down is eviction.** See the scale-down design decision above.
-- **No backup or PITR seeding.** CamusDB can seed a joining node from a backup
-  (`--pitr-bootstrap-from`), but the image must already be restored into the data directory, and the
-  node refuses to start with the flag once its WAL has data. The operator has no backup storage
-  mount or seed-on-join orchestration.
+- **New nodes catch up through Raft, not from a backup.** CamusDB can seed a joining node from a
+  backup (`--pitr-bootstrap-from`), but the image must already be restored into the data directory,
+  and the node refuses to start with the flag once its WAL has data. The operator does not seed new
+  nodes yet.
+- **Some backup refusals that clear on retry count as failures.** Kahuna refuses a coordinated
+  backup when the transactions in flight overtake its cut, and, under a replication factor, when one
+  node's share of the partitions does not arrive. Both clear on the next attempt, but CamusDB 0.16.3
+  reports them with its generic backup failure code (`CADB0704`, HTTP 500), which an I/O error also
+  uses. The operator therefore counts them as failures: `BackupFailing` turns true until the retry
+  after the failure backoff (1 minute at first) succeeds.
 - **A long-absent node can require snapshot recovery.** If the required WAL prefix was compacted,
   catch-up must use the leader's snapshot path. Retained PVCs alone do not guarantee log-only
   catch-up.
@@ -349,14 +500,16 @@ CAMUSDB_IMAGE=camusdb/camusdb:dev CAMUSDB_IMAGE_SKIP_PULL=true make test-e2e
 
 ## Not yet implemented
 
-- Backup/restore CRDs over the existing `/v1/backups/*` endpoints
-- Scheduled coordinated backups and automatic scale-up seeding
+- Restore, as a CRD or as a field, over the existing `/v1/restore` endpoint
+- Seeding scale-up nodes from a backup
 
 ## Verified
 
-`make test-e2e` runs the suite below against a real kind cluster: 8 specs on the published
-`camusdb/camusdb:0.15.2` image. Run it twice, because authentication changes the scale-down path:
-`E2E_AUTH=true make test-e2e` (~6 minutes) and `make test-e2e` (~9 minutes). Both pass 8 of 8.
+`make test-e2e` runs the suite below against a real kind cluster: 8 specs. Run it twice, because
+authentication changes the scale-down path: `E2E_AUTH=true make test-e2e` (~6 minutes) and
+`make test-e2e` (~9 minutes). Both pass 8 of 8 on the published `camusdb/camusdb:0.15.2` image. The
+suite now defaults to 0.16.3, and it has not yet run on that image, nor with placement gating or
+backups in the operator.
 
 - Bootstrap to 3 Voters with a cert-manager CA issuer in ~21–26s, producing exactly **one**
   StatefulSet revision (no spurious roll). With authentication, the nodes form the cluster over

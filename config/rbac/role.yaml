@@ -23,12 +23,14 @@ rules:
   - events
   verbs:
   - create
+  - list
   - patch
 - apiGroups:
   - ""
   resources:
   - persistentvolumeclaims
   verbs:
+  - create
   - delete
   - get
   - list

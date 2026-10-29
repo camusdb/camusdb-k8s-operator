@@ -4,12 +4,12 @@ The operator chooses pod counts through the committed CamusDB roster. Use the `C
 
 ## Found an Autoscaled Cluster with Placement
 
-Create the resource with more nodes than the replication factor. For factor 3, begin with four nodes and enough partitions to distribute the workload. Add this to a new cluster's spec:
+Create the resource with enough partitions to distribute the workload. For factor 3, beginning with four nodes gives placed partitions from the start; on CamusDB 0.16.0 and later a smaller founding size also works, as described below. Add this to a new cluster's spec:
 
 ```yaml
 spec:
   replicas: 4
-  image: camusdb/camusdb:0.15.2
+  image: camusdb/camusdb:0.16.3
   partitions: 16
   auth: {}
   replication:
@@ -26,7 +26,9 @@ spec:
 
 This is a spec fragment; the required storage and TLS fields still apply. Targets are examples to calibrate against a representative workload. `auth` is required: CamusDB serves engine metrics and the leave call to authenticated callers only, and the API server rejects `autoscaling` without it. Authentication also turns on mutual TLS between the nodes, which needs CamusDB 0.15.2 or later.
 
-A cluster founded at three nodes with factor 3 keeps fully replicated partitions; adding `replication` afterward does not convert them. Before a traffic-driven growth step the controller reads placement, and any fully replicated data partition limits growth to three nodes. An unreadable placement response blocks growth too.
+A cluster founded at three nodes with factor 3 starts with fully replicated partitions, and so does a cluster that had no `replication` before. CamusDB 0.16.0 and later convert those partitions to replica sets within a few rebalancer passes; older servers never convert them. Before a traffic-driven growth step the controller reads placement, and any fully replicated data partition limits growth to three nodes until the conversion is done. An unreadable placement response blocks growth too.
+
+With `replication` set, the operator also writes faster rebalancer pacing into `config.yml`: `kahuna.max_concurrent_replica_transfers: 4`, `kahuna.max_replica_moves_per_pass: 8` and `kahuna.replica_count_deadband: 0`. Set any of them in `spec.config` to override it.
 
 With placed partitions, a data partition has the configured 1–3 replicas, not one per cluster node. More nodes can spread partitions but cannot split a single hot key's write leader. Factor 3 tolerates one unavailable replica of a given data partition; increasing cluster node count does not raise that tolerance. Factor 1 has no data replica fault tolerance.
 
@@ -38,7 +40,7 @@ The controller resyncs an autoscaled cluster every 15 seconds and reads each eli
 - `targetQueueDepth` uses the average per-node sum of `raft.executor.client_queue_depth` from the same route: pending client proposals across partition executors.
 - `targetCPUPercent` uses the average per-node `cpu.processCpuPercent` from `GET /v1/admin/stats`: the server process's share of its node over the last minute, 0–100. It is the only signal that sees read load. It needs CamusDB 0.15.2 or later: `camusdb/camusdb:0.15.1` does not serve that route, so with that image this target only ever reports an unreadable signal.
 
-At least one target is required. The largest known signal-to-target ratio drives `ceil(current desired size × ratio)` outside the tolerance band; the recommendation is then clamped to the bounds. Four nodes at twice target recommend eight, but a completed scale-up window requests only five. The controller waits for the expected roster and ready pods before considering another traffic step. A new step must earn a new stabilization window. One exception: when everything is in place except the newest node, which is not in the roster at all — its pod cannot be scheduled, crash-loops, or cannot pull its image — the controller measures the nodes that are serving, never adds another, and may still step back down after the scale-down window, which removes the node that never joined. `AutoscalingLimited` then names the pod and why it is stuck. A node catching up as a Learner is in the roster and is never cut off this way.
+At least one target is required. The largest known signal-to-target ratio drives `ceil(current desired size × ratio)` outside the tolerance band; the recommendation is then clamped to the bounds. Four nodes at twice target recommend eight, but a completed scale-up window requests only five. The controller waits for the expected roster, ready pods and settled replica placement before considering another traffic step. Settled means no replica move in flight, no replica left on a departed node, and every node holding at least half of its even share of the data replicas; the share is waited for at most five minutes after a step. A new step must earn a new stabilization window. One exception: when everything is in place except the newest node, which is not in the roster at all — its pod cannot be scheduled, crash-loops, or cannot pull its image — the controller measures the nodes that are serving, never adds another, and may still step back down after the scale-down window, which removes the node that never joined. `AutoscalingLimited` then names the pod and why it is stuck. A node catching up as a Learner is in the roster and is never cut off this way.
 
 The default windows are 60 seconds up and 300 seconds down, with a 10% dead band. The direction must persist across observations; returning to the band or losing convergence clears the streak. This is not a historical maximum recommendation window and is not a promise that catch-up or draining finishes within the window.
 
@@ -56,6 +58,8 @@ kubectl -n camusdb logs camusdb-0 --tail=100
 ```
 
 Inspect `status.autoscaling.desiredReplicas`, `recommendedReplicas`, `logEntriesPerSecondPerNode`, `queueDepthPerNode`, `cpuPercentPerNode`, `aboveTargetSince`, `belowTargetSince`, and `lastScaleTime`. The recommendation is already bounded by min/max; it does not show uncapped demand. `AutoscalingLimited` explains missing signals/placement, a growth ceiling, or maximum count. `RosterConverged` and `status.members` distinguish a running pod from a committed Voter; when the roster cannot be read, its message quotes the cause, such as a refused login. `Available` is a readiness/quorum summary, not a health proof for every data partition.
+
+Every scale step, manual or autoscaled, waits until the roster has converged and the replica placement has settled: no replica move in flight and no replica on a node that left. An unreadable placement holds the step. `AutoscalingLimited` names the wait for an autoscaled cluster. A rolling update does not wait for placement.
 
 A scale-down asks the highest ordinal to leave before shrinking the StatefulSet. A reachable node's refusal or transport failure holds the count. A highest ordinal the roster does not list — it never joined, or already left — is removed without a leave call, even while the roster has not converged on the current size. If that pod is already absent or has no IP — or authentication is off — the controller cannot decommission it and relies on membership eviction, which takes about 90 seconds; another step waits for roster convergence. Do not force-delete live members to make a stalled scale appear complete.
 
@@ -80,6 +84,6 @@ Image, configuration and keystore changes roll pods; topology changes do not res
 
 A CamusDB release that changes its storage revision starts with an empty store and does not convert the old data. Do not raise `spec.image` across such a release on a live cluster; move the data with a logical dump and reimport as the [CamusDB documentation](https://github.com/camusdb/camusdb/blob/main/docs/logical-dump-and-reimport.md) describes.
 
-There are no backup or scheduled-backup CRDs, backup-volume mounts, or automatic seed-on-scale workflows. `spec.config` can set `kahuna.backup_dir` to a directory on the data volume, which turns on the server's backup routes; those routes, like the leave call, answer authenticated callers only.
+`spec.backup` schedules coordinated full backups and incrementals to one volume that every node shares; see [Backups](../README.md#backups). It needs `spec.auth`, because the backup routes, like the leave call, answer authenticated callers only. Inspect `status.backup` and the `BackupFailing` and `BackupVolumeReady` conditions. Restore stays manual, and the operator does not seed new nodes from a backup.
 
 See the [chart upgrade instructions](../charts/camusdb-operator/README.md#upgrading-and-the-crd-caveat) before updating CRDs.

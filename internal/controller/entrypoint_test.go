@@ -395,7 +395,8 @@ func TestServerConfigOmitsUnsetTuning(t *testing.T) {
 	cfg, _ := parseConfig(t, testCluster(3))
 	kahuna, _ := cfg[keyKahuna].(map[string]any)
 	for _, key := range []string{"locks_workers", "max_concurrent_sessions", "heartbeat_interval_ms",
-		"wal_sync_writes", "replication_factor", "enable_placement_rebalancer"} {
+		"wal_sync_writes", "replication_factor", "enable_placement_rebalancer",
+		"max_concurrent_replica_transfers", "max_replica_moves_per_pass", "replica_count_deadband"} {
 		if _, ok := kahuna[key]; ok {
 			t.Errorf("kahuna.%s written although unset; the server default should apply instead", key)
 		}
@@ -446,6 +447,10 @@ func TestServerConfigWritesSetTuning(t *testing.T) {
 		"replication_factor":    float64(3),
 		// The rebalancer comes with the factor: without it a node added later never gets replicas.
 		"enable_placement_rebalancer": true,
+		// And with the pacing that fills a new node in minutes rather than leaving it under-filled.
+		"max_concurrent_replica_transfers": float64(4),
+		"max_replica_moves_per_pass":       float64(8),
+		"replica_count_deadband":           float64(0),
 	}
 	for k, v := range want {
 		if kahuna[k] != v {
@@ -460,7 +465,7 @@ func TestServerConfigMergesSpecConfig(t *testing.T) {
 	cluster := testCluster(3)
 	cluster.Spec.Replication = &camusdbv1alpha1.ReplicationSpec{Factor: 3}
 	cluster.Spec.Config = &runtime.RawExtension{Raw: []byte(
-		`{"slow_query_log_threshold_ms": 500, "grpc_port": 6000, "kahuna": {"replication_factor": 2, "backup_dir": "/storage/data/backups"}}`)}
+		`{"slow_query_log_threshold_ms": 500, "grpc_port": 6000, "kahuna": {"replication_factor": 2, "max_replica_moves_per_pass": 2, "backup_dir": "/storage/data/backups"}}`)}
 
 	cfg, raw := parseConfig(t, cluster)
 	kahuna, _ := cfg[keyKahuna].(map[string]any)
@@ -469,6 +474,10 @@ func TestServerConfigMergesSpecConfig(t *testing.T) {
 	}
 	if kahuna["replication_factor"] != float64(2) {
 		t.Errorf("kahuna.replication_factor = %v, want the spec.config value 2", kahuna["replication_factor"])
+	}
+	if kahuna["max_replica_moves_per_pass"] != float64(2) || kahuna["max_concurrent_replica_transfers"] != float64(4) {
+		t.Errorf("rebalancer pacing = %v / %v, want the spec.config override and the generated value",
+			kahuna["max_replica_moves_per_pass"], kahuna["max_concurrent_replica_transfers"])
 	}
 	if kahuna["enable_placement_rebalancer"] != true || kahuna["storage"] != string(camusdbv1alpha1.StorageBackendRocksDB) {
 		t.Errorf("generated kahuna settings dropped by the merge: %v", kahuna)

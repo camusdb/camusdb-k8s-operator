@@ -58,11 +58,22 @@ const (
 	topologyFileName = "topology.env"
 	topologyPath     = configMountPath + "/" + topologyFileName
 
-	dataVolumeName   = "data"
-	walVolumeName    = "wal"
-	configVolumeName = "config"
-	tlsVolumeName    = "tls"
-	trustVolumeName  = "trust"
+	// backupMountPath is where the shared backup volume is mounted. The server's backup directory
+	// is a subdirectory named after the cluster; see backupPath.
+	backupMountPath = "/backup"
+	// backupMACMountPath holds the key that signs backup manifests. It is outside the backup
+	// directory, as the server requires.
+	backupMACMountPath = "/etc/camusdb/backup-mac"
+	backupMACFileName  = "key"
+	backupMACKeyPath   = backupMACMountPath + "/" + backupMACFileName
+
+	dataVolumeName      = "data"
+	walVolumeName       = "wal"
+	configVolumeName    = "config"
+	tlsVolumeName       = "tls"
+	trustVolumeName     = "trust"
+	backupVolumeName    = "backup"
+	backupMACVolumeName = "backup-mac"
 
 	containerName = "camusdb"
 
@@ -116,6 +127,36 @@ func adminSecretName(cluster *camusdbv1alpha1.CamusDBCluster) string { return cl
 // authKeysSecretName is the generated Secret holding the token key and node secret every node shares.
 func authKeysSecretName(cluster *camusdbv1alpha1.CamusDBCluster) string {
 	return cluster.Name + "-auth-keys"
+}
+
+// backupClaimName is the PersistentVolumeClaim holding the backups: the user's own claim, or the
+// one the operator creates from spec.backup.volume.claim.
+func backupClaimName(cluster *camusdbv1alpha1.CamusDBCluster) string {
+	if v := cluster.Spec.Backup.Volume; v.ClaimName != nil {
+		return *v.ClaimName
+	}
+	return cluster.Name + "-backup"
+}
+
+// backupMACSecretName is the Secret the operator generates when no MAC key is supplied.
+func backupMACSecretName(cluster *camusdbv1alpha1.CamusDBCluster) string {
+	return cluster.Name + "-backup-mac"
+}
+
+// backupPath is the server's backup directory. It is a subdirectory of the mount, not the mount
+// itself, for two reasons. Two clusters can then share one claim. And the server refuses a backup
+// directory that is group-writable, which the root of a volume often is (an fsGroup makes it so);
+// a subdirectory that does not exist yet is created by the server with mode 0700.
+func backupPath(cluster *camusdbv1alpha1.CamusDBCluster) string {
+	return backupMountPath + "/" + cluster.Name
+}
+
+// backupClusterID is the id stamped into every backup.
+func backupClusterID(cluster *camusdbv1alpha1.CamusDBCluster) string {
+	if id := cluster.Spec.Backup.ClusterID; id != "" {
+		return id
+	}
+	return cluster.Namespace + "/" + cluster.Name
 }
 
 // podName returns the pod name for an ordinal. StatefulSet pod names are stable, which is what
@@ -213,6 +254,12 @@ func specReplicas(cluster *camusdbv1alpha1.CamusDBCluster) int32 {
 		return 3
 	}
 	return *cluster.Spec.Replicas
+}
+
+// singleNode reports whether the cluster has one node and always will. The CRD refuses to scale a
+// single-node cluster into a multi-node one, and autoscaling starts at 3 nodes.
+func singleNode(cluster *camusdbv1alpha1.CamusDBCluster) bool {
+	return cluster.Spec.Autoscaling == nil && specReplicas(cluster) == 1
 }
 
 // initialAutoscaledReplicas is where the autoscaler starts before it has chosen anything:

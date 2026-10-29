@@ -359,3 +359,109 @@ func TestMetricKindsMatchWhateverTheCase(t *testing.T) {
 		t.Errorf("GaugeSum = %v, %v; want 2, true", sum, ok)
 	}
 }
+
+// testBackupID is the id the test servers report for a backup.
+const testBackupID = "7f1c"
+
+// backupServer answers the backup routes with a fixed status and body, and records each request.
+func backupServer(t *testing.T, status int, body string) (*httptest.Server, *[]*http.Request, *[]map[string]string) {
+	t.Helper()
+	var reqs []*http.Request
+	var bodies []map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs = append(reqs, r)
+		in := map[string]string{}
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		bodies = append(bodies, in)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &reqs, &bodies
+}
+
+func TestCoordinatedBackupReturnsTheBackup(t *testing.T) {
+	srv, reqs, _ := backupServer(t, http.StatusOK,
+		`{"status":"ok","backup":{"backupId":"`+testBackupID+`","type":"Full","clusterId":"ns/c","coordinatorNode":"c-1"}}`)
+	c := NewHTTPClient(testReadTimeout, testLeaveTimeout)
+
+	info, err := c.TakeCoordinatedBackup(context.Background(), Target{BaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("TakeCoordinatedBackup: %v", err)
+	}
+	if info.BackupID != testBackupID || info.Type != BackupTypeFull || info.CoordinatorNode != "c-1" {
+		t.Fatalf("got %+v", info)
+	}
+	if r := (*reqs)[0]; r.Method != http.MethodPost || r.URL.Path != "/v1/backups/coordinated" {
+		t.Fatalf("sent %s %s", r.Method, r.URL.Path)
+	}
+}
+
+func TestIncrementalBackupSendsTheParent(t *testing.T) {
+	srv, reqs, bodies := backupServer(t, http.StatusOK,
+		`{"status":"ok","backup":{"backupId":"8a2d","type":"Incremental","parentBackupId":"`+testBackupID+`"}}`)
+	c := NewHTTPClient(testReadTimeout, testLeaveTimeout)
+
+	info, err := c.TakeIncrementalBackup(context.Background(), Target{BaseURL: srv.URL}, testBackupID)
+	if err != nil {
+		t.Fatalf("TakeIncrementalBackup: %v", err)
+	}
+	if info.ParentBackupID != testBackupID {
+		t.Fatalf("got %+v", info)
+	}
+	r := (*reqs)[0]
+	if r.URL.Path != "/v1/backups/incremental" || r.Header.Get("Content-Type") != "application/json" {
+		t.Fatalf("sent %s with Content-Type %q", r.URL.Path, r.Header.Get("Content-Type"))
+	}
+	if got := (*bodies)[0]["parentBackupId"]; got != testBackupID {
+		t.Fatalf("parentBackupId = %q", got)
+	}
+}
+
+// A full backup runs for minutes, so the read timeout must not cut it short.
+func TestBackupIsNotBoundByTheReadTimeout(t *testing.T) {
+	srv := delayedServer(t, "/v1/backups/coordinated", `{"status":"ok","backup":{"backupId":"`+testBackupID+`","type":"Full"}}`, testServerDelay)
+	c := NewHTTPClient(testReadTimeout, testLeaveTimeout)
+
+	if _, err := c.TakeCoordinatedBackup(context.Background(), Target{BaseURL: srv.URL}); err != nil {
+		t.Fatalf("a slow backup failed: %v", err)
+	}
+}
+
+func TestRefusedBackupCarriesTheCode(t *testing.T) {
+	srv, _, _ := backupServer(t, http.StatusMisdirectedRequest,
+		`{"status":"failed","code":"CADB070E","message":"this node does not coordinate backups"}`)
+	c := NewHTTPClient(testReadTimeout, testLeaveTimeout)
+
+	_, err := c.TakeCoordinatedBackup(context.Background(), Target{BaseURL: srv.URL})
+	var be *BackupError
+	if !errors.As(err, &be) {
+		t.Fatalf("got %v, want a *BackupError", err)
+	}
+	if be.StatusCode != http.StatusMisdirectedRequest || be.Code != BackupCodeNotCoordinator || !be.TryAnotherNode() || !be.ClearsOnRetry() {
+		t.Fatalf("got %+v", be)
+	}
+}
+
+// The generic failure code covers causes that clear on retry and an I/O error alike, so another
+// node is asked but the refusal is not taken as one that clears.
+func TestGenericBackupFailureIsNotTakenAsClearing(t *testing.T) {
+	be := &BackupError{StatusCode: http.StatusInternalServerError, Code: BackupCodeFailed}
+	if !be.TryAnotherNode() || be.ClearsOnRetry() {
+		t.Fatalf("TryAnotherNode %v, ClearsOnRetry %v", be.TryAnotherNode(), be.ClearsOnRetry())
+	}
+	parent := &BackupError{StatusCode: http.StatusNotFound, Code: BackupCodeParentMissing}
+	if parent.TryAnotherNode() || parent.ClearsOnRetry() {
+		t.Fatal("another node would repeat a missing parent")
+	}
+}
+
+func TestBackupWithoutAnIDIsAnError(t *testing.T) {
+	srv, _, _ := backupServer(t, http.StatusOK, `{"status":"ok"}`)
+	c := NewHTTPClient(testReadTimeout, testLeaveTimeout)
+
+	if _, err := c.TakeCoordinatedBackup(context.Background(), Target{BaseURL: srv.URL}); err == nil {
+		t.Fatal("accepted a response with no backup id")
+	}
+}

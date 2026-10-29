@@ -86,6 +86,9 @@ type CamusDBClusterReconciler struct {
 
 	// traffic turns the cluster's cumulative counters into rates for the autoscaler.
 	traffic trafficSampler
+
+	// backups runs scheduled backups outside the reconcile loop.
+	backups backupRunner
 }
 
 // +kubebuilder:rbac:groups=camusdb.io,resources=camusdbclusters,verbs=get;list;watch;create;update;patch;delete
@@ -94,8 +97,8 @@ type CamusDBClusterReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services;configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;delete
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=events,verbs=list;create;patch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
@@ -108,6 +111,7 @@ func (r *CamusDBClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if err := r.clusterReader().Get(ctx, req.NamespacedName, cluster); err != nil {
 		if apierrors.IsNotFound(err) {
 			r.traffic.forget(req.NamespacedName)
+			r.backups.forget(req.NamespacedName)
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -152,6 +156,11 @@ func (r *CamusDBClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if err := r.reconcilePDB(ctx, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconciling pod disruption budget: %w", err)
 	}
+	// Before the StatefulSet, for the same reason as the keystore: a pod whose backup claim or key
+	// does not exist yet stays stuck on the missing volume.
+	if err := r.reconcileBackupResources(ctx, cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("reconciling backup resources: %w", err)
+	}
 
 	pods, err := r.listPods(ctx, cluster)
 	if err != nil {
@@ -171,6 +180,19 @@ func (r *CamusDBClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		log.V(1).Info("Could not read cluster membership", "error", membershipErr)
 	}
 
+	// The placement is what says whether the data has followed the last membership change. It is
+	// read once here for the same reason as the roster, and an unreadable one is handled the same
+	// way: buildPlan holds, because not knowing whether replicas are still moving is not a state
+	// to take another node out of.
+	var placement *camusdb.Placement
+	placementErr := membershipErr
+	if acc != nil {
+		placement, placementErr = r.readPlacement(ctx, cluster, acc, pods)
+		if placementErr != nil {
+			log.V(1).Info("Could not read replica placement", "error", placementErr)
+		}
+	}
+
 	// The autoscaler edits cluster.Status in memory, so the stored status is captured first: it is
 	// what the status write has to be compared against, or an autoscaler-only change would look
 	// like no change and never be persisted.
@@ -178,7 +200,7 @@ func (r *CamusDBClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// The autoscaler runs before the StatefulSet is sized because it is what decides the size:
 	// everything below reads the target through desiredReplicas, which consults the state set here.
-	r.reconcileAutoscaling(ctx, cluster, acc, bootstrapped, membership, pods)
+	r.reconcileAutoscaling(ctx, cluster, acc, bootstrapped, membership, placement, placementErr, pods)
 
 	// A new size is recorded before anything acts on it. Resizing first and failing the status
 	// write afterwards leaves the old size stored, and the next pass would walk the StatefulSet
@@ -191,14 +213,20 @@ func (r *CamusDBClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		persisted = cluster.Status.DeepCopy()
 	}
 
-	sts, err := r.reconcileStatefulSet(ctx, cluster, acc, bootstrapped, membership, pods, rc, keystore)
+	sts, err := r.reconcileStatefulSet(ctx, cluster, acc, bootstrapped, membership, placement, placementErr, pods, rc, keystore)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconciling stateful set: %w", err)
 	}
 
+	// The backup scheduler edits cluster.Status in memory too, and reconcileStatus persists it.
+	backupWake := r.reconcileBackup(ctx, cluster, acc, membership, pods, rc)
+
 	result, err := r.reconcileStatus(ctx, cluster, persisted, sts, pods, membership, membershipErr, keystore)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating status: %w", err)
+	}
+	if backupWake > 0 && (result.RequeueAfter == 0 || backupWake < result.RequeueAfter) {
+		result.RequeueAfter = backupWake
 	}
 
 	log.V(1).Info("Reconciled CamusDBCluster", "phase", cluster.Status.Phase,
@@ -278,7 +306,7 @@ type keystoreInfo struct {
 // reconcileStatefulSet creates or updates the StatefulSet, applying the size and rolling-update
 // partition that buildPlan considers safe right now. It returns nil when there is no StatefulSet
 // yet and none may be created.
-func (r *CamusDBClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *camusdbv1alpha1.CamusDBCluster, acc *nodeAccess, bootstrapped bool, membership *camusdb.Membership, pods []corev1.Pod, rc rendered, keystore keystoreInfo) (*appsv1.StatefulSet, error) {
+func (r *CamusDBClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *camusdbv1alpha1.CamusDBCluster, acc *nodeAccess, bootstrapped bool, membership *camusdb.Membership, placement *camusdb.Placement, placementErr error, pods []corev1.Pod, rc rendered, keystore keystoreInfo) (*appsv1.StatefulSet, error) {
 	// bootstrapped decides whether a scale step may be taken at all, not what the pods look like.
 	existing := &appsv1.StatefulSet{}
 	err := r.Get(ctx, types.NamespacedName{Name: stsName(cluster), Namespace: cluster.Namespace}, existing)
@@ -309,7 +337,7 @@ func (r *CamusDBClusterReconciler) reconcileStatefulSet(ctx context.Context, clu
 	if existing.Spec.Replicas != nil {
 		currentReplicas = *existing.Spec.Replicas
 	}
-	p := buildPlan(cluster, currentReplicas, bootstrapped, membership)
+	p := buildPlan(cluster, currentReplicas, bootstrapped, membership, placement, placementErr)
 
 	// Shrinking means removing a member, and a member leaves the roster properly by asking. Doing
 	// it here rather than deleting the pod and waiting for the cluster to notice keeps a planned
@@ -372,7 +400,12 @@ func (r *CamusDBClusterReconciler) reconcileStatus(ctx context.Context, cluster 
 	status.ObservedGeneration = cluster.Generation
 	status.Replicas = sts.Status.Replicas
 	status.ReadyReplicas = sts.Status.ReadyReplicas
-	status.CurrentImage = cluster.Spec.Image
+	// currentImage names what the nodes run, not what they were asked to run. It moves only once
+	// every node runs the new image and is ready, so a stuck rollout still shows the image the
+	// cluster ran before.
+	if imageRolledOut(cluster, sts, pods) {
+		status.CurrentImage = cluster.Spec.Image
+	}
 	sel, err := metav1.LabelSelectorAsSelector(selector(cluster))
 	if err != nil {
 		return ctrl.Result{}, err
@@ -400,35 +433,22 @@ func (r *CamusDBClusterReconciler) reconcileStatus(ctx context.Context, cluster 
 	}
 
 	rosterConverged := rosterKnown && status.Voters == desired && status.Learners == 0
-	progressing := status.ReadyReplicas < desired || !rosterConverged
+	// An image rollout can sit between two pod restarts with every node ready, so readiness alone
+	// would report the cluster Running half-way through it.
+	imageCurrent := status.CurrentImage == cluster.Spec.Image
+	progressing := status.ReadyReplicas < desired || !rosterConverged || !imageCurrent
 
-	// Degraded is reserved for a cluster that is actually in trouble — quorum lost, or its state
-	// unreadable. A cluster part-way through a scale is working exactly as intended, and
-	// labelling that Degraded would train operators to ignore the word.
-	switch {
-	case !status.Bootstrapped && !keystore.ready && status.Replicas == 0:
-		status.Phase = camusdbv1alpha1.PhasePending
-	case !status.Bootstrapped:
-		status.Phase = camusdbv1alpha1.PhaseBootstrapping
-	case !hasQuorum(status.ReadyReplicas, desired) || !rosterKnown:
-		status.Phase = camusdbv1alpha1.PhaseDegraded
-	case status.Replicas < desired || status.Voters < desired:
-		status.Phase = camusdbv1alpha1.PhaseScalingUp
-	case status.Replicas > desired || status.Voters > desired:
-		status.Phase = camusdbv1alpha1.PhaseScalingDown
-	case progressing:
-		// Right size, right roster, but not every node is serving yet: a rolling restart.
-		status.Phase = camusdbv1alpha1.PhaseUpgrading
-	default:
-		status.Phase = camusdbv1alpha1.PhaseRunning
-	}
+	status.Phase = clusterPhase(status, desired, keystore.ready, rosterKnown, progressing)
 
 	setCondition(status, conditionKeystoreReady, keystore.ready,
 		"KeystoreAvailable", "KeystorePending", keystoreOrDefault(keystore.message))
 
+	progressMsg := fmt.Sprintf("%d/%d nodes ready, %d voters", status.ReadyReplicas, desired, status.Voters)
+	if !imageCurrent {
+		progressMsg += fmt.Sprintf(", rolling out image %s", cluster.Spec.Image)
+	}
 	setCondition(status, camusdbv1alpha1.ConditionProgressing, progressing,
-		"Converging", "Converged",
-		fmt.Sprintf("%d/%d nodes ready, %d voters", status.ReadyReplicas, desired, status.Voters))
+		"Converging", "Converged", progressMsg)
 	setCondition(status, camusdbv1alpha1.ConditionRosterConverged, rosterConverged,
 		"RosterMatchesSpec", "RosterDiffers",
 		rosterMessage(membershipErr, status.Voters, status.Learners, desired))
@@ -454,6 +474,54 @@ func (r *CamusDBClusterReconciler) reconcileStatus(ctx context.Context, cluster 
 		return ctrl.Result{RequeueAfter: requeueAutoscaling}, nil
 	}
 	return ctrl.Result{RequeueAfter: requeueSteady}, nil
+}
+
+// clusterPhase summarizes the status for kubectl get.
+//
+// Degraded is reserved for a cluster that is actually in trouble — quorum lost, or its state
+// unreadable. A cluster part-way through a scale is working exactly as intended, and labelling that
+// Degraded would train operators to ignore the word.
+func clusterPhase(status *camusdbv1alpha1.CamusDBClusterStatus, desired int32, keystoreReady, rosterKnown, progressing bool) camusdbv1alpha1.ClusterPhase {
+	switch {
+	case !status.Bootstrapped && !keystoreReady && status.Replicas == 0:
+		return camusdbv1alpha1.PhasePending
+	case !status.Bootstrapped:
+		return camusdbv1alpha1.PhaseBootstrapping
+	case !hasQuorum(status.ReadyReplicas, desired) || !rosterKnown:
+		return camusdbv1alpha1.PhaseDegraded
+	case status.Replicas < desired || status.Voters < desired:
+		return camusdbv1alpha1.PhaseScalingUp
+	case status.Replicas > desired || status.Voters > desired:
+		return camusdbv1alpha1.PhaseScalingDown
+	case progressing:
+		// Right size, right roster, but not every node is serving the current configuration and
+		// image yet: a rolling restart.
+		return camusdbv1alpha1.PhaseUpgrading
+	default:
+		return camusdbv1alpha1.PhaseRunning
+	}
+}
+
+// imageRolledOut reports whether every node the StatefulSet now has runs the cluster's image and
+// is ready. The StatefulSet's own counters cannot answer this: the operator holds the
+// rolling-update partition, and a revision also changes with the configuration.
+func imageRolledOut(cluster *camusdbv1alpha1.CamusDBCluster, sts *appsv1.StatefulSet, pods []corev1.Pod) bool {
+	replicas := int32(0)
+	if sts.Spec.Replicas != nil {
+		replicas = *sts.Spec.Replicas
+	}
+	seen := int32(0)
+	for i := range pods {
+		pod := &pods[i]
+		if o := ordinalOf(pod.Name); o < 0 || o >= replicas {
+			continue
+		}
+		if pod.DeletionTimestamp != nil || !podIsReady(pod) || podImage(pod) != cluster.Spec.Image {
+			return false
+		}
+		seen++
+	}
+	return replicas > 0 && seen == replicas
 }
 
 // keystoreOrDefault supplies a message for the ready case, where there is nothing to explain.

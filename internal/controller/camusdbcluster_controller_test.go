@@ -62,9 +62,11 @@ type fakeCamusDB struct {
 	leaveCalls []string
 	// targets records every node the operator called, so a test can assert how it called them.
 	targets []camusdb.Target
-	// placement is the replica placement reported; nil means every data partition has a replica
-	// set, which is what a cluster created with more nodes than its factor looks like.
+	// placement is the replica placement reported; nil derives a settled one from the roster,
+	// which is what a cluster looks like once the rebalancer has finished with it.
 	placement *camusdb.Placement
+	// placementErr is returned instead, when set.
+	placementErr error
 	// metrics returns the dashboard metrics for a base URL; nil means the endpoint is refused.
 	metrics func(baseURL string) *camusdb.Metrics
 	// cpu is the process CPU share every node reports; nil means the route does not exist.
@@ -73,12 +75,41 @@ type fakeCamusDB struct {
 
 func (f *fakeCamusDB) Placement(_ context.Context, t camusdb.Target) (*camusdb.Placement, error) {
 	f.targets = append(f.targets, t)
+	if f.placementErr != nil {
+		return nil, f.placementErr
+	}
 	if f.placement != nil {
 		return f.placement, nil
 	}
-	return &camusdb.Placement{ReplicationFactor: 3, Initialized: true, Partitions: []camusdb.PartitionPlacement{
-		{PartitionID: 1, State: camusdb.PartitionStateActive, Replicas: []camusdb.ReplicaPlacement{{Endpoint: "a"}, {Endpoint: "b"}, {Endpoint: "c"}}},
-	}}, nil
+	// A settled placement for the roster being served: six data partitions, three Voter replicas
+	// each, spread round-robin so every member carries a share.
+	p := &camusdb.Placement{ReplicationFactor: 3, Initialized: true}
+	if f.membership == nil || len(f.membership.Members) < 3 {
+		return p, nil
+	}
+	n := len(f.membership.Members)
+	for id := int32(1); id <= 6; id++ {
+		part := camusdb.PartitionPlacement{PartitionID: id, State: camusdb.PartitionStateActive, EffectiveReplicationFactor: 3}
+		for j := range 3 {
+			part.Replicas = append(part.Replicas, camusdb.ReplicaPlacement{
+				Endpoint: f.membership.Members[(int(id)+j)%n].Endpoint, Role: replicaRoleVoter,
+			})
+		}
+		p.Partitions = append(p.Partitions, part)
+	}
+	return p, nil
+}
+
+// TakeCoordinatedBackup records the call and returns a new backup.
+func (f *fakeCamusDB) TakeCoordinatedBackup(_ context.Context, t camusdb.Target) (*camusdb.BackupInfo, error) {
+	f.targets = append(f.targets, t)
+	return &camusdb.BackupInfo{BackupID: "b-" + t.BaseURL, Type: camusdb.BackupTypeFull}, nil
+}
+
+// TakeIncrementalBackup records the call and returns a new backup on top of the parent.
+func (f *fakeCamusDB) TakeIncrementalBackup(_ context.Context, t camusdb.Target, parent string) (*camusdb.BackupInfo, error) {
+	f.targets = append(f.targets, t)
+	return &camusdb.BackupInfo{BackupID: "i-" + t.BaseURL, Type: camusdb.BackupTypeIncremental, ParentBackupID: parent}, nil
 }
 
 func (f *fakeCamusDB) Metrics(_ context.Context, t camusdb.Target) (*camusdb.Metrics, error) {
@@ -420,6 +451,99 @@ var _ = Describe("CamusDBCluster Controller", func() {
 
 		reconcileWith(rosterOf(cluster, 4), nil)
 		Expect(*getSTS().Spec.Replicas).To(Equal(int32(3)))
+	})
+
+	It("holds a manual scale-down while the last node's replicas are still being repaired", func() {
+		reconcileWith(rosterOf(cluster, 3), nil)
+		obj := getCluster()
+		obj.Spec.Replicas = ptr.To(int32(5))
+		Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+		reconcileWith(rosterOf(cluster, 3), nil)
+		reconcileWith(rosterOf(cluster, 4), nil)
+		reconcileWith(rosterOf(cluster, 5), nil)
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(5)))
+
+		obj = getCluster()
+		obj.Spec.Replicas = ptr.To(int32(3))
+		Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+		reconcileWith(rosterOf(cluster, 5), nil)
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)))
+
+		// The roster has let the fifth node go, but its replicas have not been repaired onto the
+		// survivors yet: a partition still lists it. Taking the next node away now would remove a
+		// second copy from partitions that have already lost one.
+		stale, _ := (&fakeCamusDB{membership: rosterOf(cluster, 5)}).Placement(ctx, camusdb.Target{})
+		fake := reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 4), placement: stale})
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)), "scaled down while replicas were stranded on the departed node")
+		Expect(fake.leaveCalls).To(BeEmpty(), "asked a node to leave while repairs were still running")
+
+		// Repairs done: the placement names only members again, and the next step proceeds.
+		reconcileWith(rosterOf(cluster, 4), nil)
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(3)))
+	})
+
+	It("holds a manual scale-up while replicas are still moving onto the last node", func() {
+		reconcileWith(rosterOf(cluster, 3), nil)
+		obj := getCluster()
+		obj.Spec.Replicas = ptr.To(int32(5))
+		Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+		reconcileWith(rosterOf(cluster, 3), nil)
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)))
+
+		moving, _ := (&fakeCamusDB{membership: rosterOf(cluster, 4)}).Placement(ctx, camusdb.Target{})
+		moving.Partitions[0].Replicas[0].Role = camusdb.RoleLearner
+		reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 4), placement: moving})
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)), "stacked a scale-up on replica moves still in flight")
+
+		// A placement that cannot be read holds the step too.
+		reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 4), placementErr: fmt.Errorf("connection refused")})
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)), "scaled without knowing whether replicas were still moving")
+
+		reconcileWith(rosterOf(cluster, 4), nil)
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(5)))
+	})
+
+	It("does not let an unreadable placement hold a cluster that is not scaling", func() {
+		reconcileWith(rosterOf(cluster, 3), nil)
+		reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 3), placementErr: fmt.Errorf("connection refused")})
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(3)))
+		Expect(getCluster().Status.Phase).To(Equal(camusdbv1alpha1.PhaseRunning))
+	})
+
+	It("reports the new image only once every node runs it", func() {
+		reconcileWith(rosterOf(cluster, 3), nil)
+		Expect(getCluster().Status.CurrentImage).To(Equal("camusdb/camusdb:dev"))
+
+		obj := getCluster()
+		obj.Spec.Image = "camusdb/camusdb:next"
+		Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+		reconcileWith(rosterOf(cluster, 3), nil)
+
+		// Every node is still ready on the old image, which readiness alone would call Running.
+		out := getCluster()
+		Expect(out.Status.CurrentImage).To(Equal("camusdb/camusdb:dev"), "reported an image no node runs yet")
+		Expect(out.Status.Phase).To(Equal(camusdbv1alpha1.PhaseUpgrading))
+		progressing := apimeta.FindStatusCondition(out.Status.Conditions, camusdbv1alpha1.ConditionProgressing)
+		Expect(progressing.Status).To(Equal(metav1.ConditionTrue))
+		Expect(progressing.Message).To(ContainSubstring("rolling out image camusdb/camusdb:next"))
+
+		// Two of three nodes replaced: still the old image.
+		setImage := func(ordinal int32) {
+			pod := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: podName(cluster, ordinal), Namespace: namespace}, pod)).To(Succeed())
+			pod.Spec.Containers[0].Image = "camusdb/camusdb:next"
+			Expect(k8sClient.Update(ctx, pod)).To(Succeed())
+		}
+		setImage(2)
+		setImage(1)
+		reconcileWith(rosterOf(cluster, 3), nil)
+		Expect(getCluster().Status.CurrentImage).To(Equal("camusdb/camusdb:dev"))
+
+		setImage(0)
+		reconcileWith(rosterOf(cluster, 3), nil)
+		out = getCluster()
+		Expect(out.Status.CurrentImage).To(Equal("camusdb/camusdb:next"))
+		Expect(out.Status.Phase).To(Equal(camusdbv1alpha1.PhaseRunning))
 	})
 
 	It("asks the departing node to leave before removing its pod", func() {
@@ -819,6 +943,43 @@ var _ = Describe("CamusDBCluster Controller", func() {
 			Expect(limited).NotTo(BeNil())
 			Expect(limited.Status).To(Equal(metav1.ConditionTrue))
 			Expect(limited.Message).To(ContainSubstring("fully replicated"))
+
+			// CamusDB 0.16.0 converts those partitions to replica sets on its own. Once placement
+			// shows them placed, the same load grows the cluster with no change to the spec.
+			for range 4 {
+				reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 3), metrics: load})
+			}
+			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(4)))
+			Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)))
+		})
+
+		It("waits for the data to follow a step before taking the next one", func() {
+			autoscale()
+			load := steadyLoad(5000)
+
+			reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 4), metrics: load})
+			reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 4), metrics: load})
+			reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 4), metrics: load})
+			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(5)))
+
+			// The fifth node is a committed Voter and its pod is ready, but the rebalancer is still
+			// moving a replica onto it. The roster alone would call this converged.
+			grown := rosterOf(cluster, 5)
+			moving, _ := (&fakeCamusDB{membership: grown}).Placement(ctx, camusdb.Target{})
+			moving.Partitions[0].Replicas[0].Role = camusdb.RoleLearner
+			reconcileUsing(&fakeCamusDB{membership: grown, metrics: load, placement: moving})
+			reconcileUsing(&fakeCamusDB{membership: grown, metrics: load, placement: moving})
+			out := getCluster()
+			Expect(out.Status.Autoscaling.DesiredReplicas).To(Equal(int32(5)), "stacked a step on one whose data is still moving")
+			limited := apimeta.FindStatusCondition(out.Status.Conditions, camusdbv1alpha1.ConditionAutoscalingLimited)
+			Expect(limited).NotTo(BeNil())
+			Expect(limited.Status).To(Equal(metav1.ConditionFalse), "a move in flight is not a limit")
+			Expect(limited.Message).To(ContainSubstring("replica moves in flight"))
+
+			// Once the move lands the step is complete and load may ask for the next node.
+			reconcileUsing(&fakeCamusDB{membership: grown, metrics: load})
+			reconcileUsing(&fakeCamusDB{membership: grown, metrics: load})
+			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(6)))
 		})
 
 		It("holds and says why when the metrics endpoint is missing", func() {
@@ -884,6 +1045,112 @@ var _ = Describe("CamusDBCluster Controller", func() {
 				MinReplicas: 1, MaxReplicas: 6, TargetLogEntriesPerSecond: ptr.To(int32(1000)),
 			}
 			Expect(k8sClient.Update(ctx, obj)).NotTo(Succeed())
+		})
+	})
+
+	Context("with backups", func() {
+		enableBackups := func() {
+			obj := getCluster()
+			obj.Spec.Auth = &camusdbv1alpha1.AuthSpec{}
+			obj.Spec.Backup = &camusdbv1alpha1.BackupSpec{
+				Schedule: testBackupSchedule,
+				Volume: camusdbv1alpha1.BackupVolumeSpec{
+					Claim: &camusdbv1alpha1.VolumeSpec{Size: resource.MustParse("5Gi")},
+				},
+			}
+			Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+		}
+
+		It("creates the shared claim and the signing key, and mounts both", func() {
+			enableBackups()
+			reconcileWith(rosterOf(cluster, 3), nil)
+
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-backup", Namespace: namespace}, pvc)).To(Succeed())
+			Expect(pvc.Spec.AccessModes).To(ConsistOf(corev1.ReadWriteMany))
+			Expect(pvc.OwnerReferences).To(BeEmpty(), "the backups would be deleted with the cluster")
+
+			mac := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-backup-mac", Namespace: namespace}, mac)).To(Succeed())
+			Expect(mac.Data[backupMACKey]).To(HaveLen(backupMACKeyBytes))
+			Expect(mac.OwnerReferences).To(BeEmpty(), "the key would be deleted with the cluster")
+
+			mounts := map[string]string{}
+			for _, m := range getSTS().Spec.Template.Spec.Containers[0].VolumeMounts {
+				mounts[m.Name] = m.MountPath
+			}
+			Expect(mounts).To(HaveKeyWithValue(backupVolumeName, backupMountPath))
+			Expect(mounts).To(HaveKeyWithValue(backupMACVolumeName, backupMACMountPath))
+
+			cm := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: configMapName(cluster), Namespace: namespace}, cm)).To(Succeed())
+			Expect(cm.Data[serverConfigFileName]).To(ContainSubstring("backup_dir: /backup/" + name))
+
+			// The key is never rewritten: a new one would fail every earlier backup's check.
+			reconcileWith(rosterOf(cluster, 3), nil)
+			again := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-backup-mac", Namespace: namespace}, again)).To(Succeed())
+			Expect(again.Data[backupMACKey]).To(Equal(mac.Data[backupMACKey]))
+		})
+
+		It("waits for the claim to bind and names it", func() {
+			enableBackups()
+			fake := reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 3)})
+
+			out := getCluster()
+			volume := apimeta.FindStatusCondition(out.Status.Conditions, camusdbv1alpha1.ConditionBackupVolumeReady)
+			Expect(volume).NotTo(BeNil())
+			Expect(volume.Status).To(Equal(metav1.ConditionFalse))
+			Expect(volume.Message).To(ContainSubstring(name + "-backup"))
+			failing := apimeta.FindStatusCondition(out.Status.Conditions, camusdbv1alpha1.ConditionBackupFailing)
+			Expect(failing).NotTo(BeNil())
+			Expect(failing.Status).To(Equal(metav1.ConditionFalse), "waiting for a claim is not a failure")
+			Expect(failing.Reason).To(Equal("BackupWaiting"))
+			Expect(out.Status.Backup).NotTo(BeNil())
+			for _, t := range fake.targets {
+				Expect(t.BaseURL).NotTo(ContainSubstring("backup"))
+			}
+		})
+
+		It("removes the backup state when backups are turned off", func() {
+			enableBackups()
+			reconcileWith(rosterOf(cluster, 3), nil)
+			Expect(getCluster().Status.Backup).NotTo(BeNil())
+
+			obj := getCluster()
+			obj.Spec.Backup = nil
+			Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+			reconcileWith(rosterOf(cluster, 3), nil)
+			out := getCluster()
+			Expect(out.Status.Backup).To(BeNil())
+			Expect(apimeta.FindStatusCondition(out.Status.Conditions, camusdbv1alpha1.ConditionBackupFailing)).To(BeNil())
+			Expect(apimeta.FindStatusCondition(out.Status.Conditions, camusdbv1alpha1.ConditionBackupVolumeReady)).To(BeNil())
+		})
+
+		It("rejects backups without authentication", func() {
+			obj := getCluster()
+			obj.Spec.Backup = &camusdbv1alpha1.BackupSpec{
+				Schedule: testBackupSchedule,
+				Volume:   camusdbv1alpha1.BackupVolumeSpec{ClaimName: ptr.To("shared")},
+			}
+			err := k8sClient.Update(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("backup requires spec.auth"))
+		})
+
+		It("rejects a volume that names both a claim and a claim template", func() {
+			obj := getCluster()
+			obj.Spec.Auth = &camusdbv1alpha1.AuthSpec{}
+			obj.Spec.Backup = &camusdbv1alpha1.BackupSpec{
+				Schedule: testBackupSchedule,
+				Volume: camusdbv1alpha1.BackupVolumeSpec{
+					ClaimName: ptr.To("shared"),
+					Claim:     &camusdbv1alpha1.VolumeSpec{Size: resource.MustParse("5Gi")},
+				},
+			}
+			err := k8sClient.Update(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("exactly one of backup.volume.claimName or backup.volume.claim"))
 		})
 	})
 

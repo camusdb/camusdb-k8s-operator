@@ -37,6 +37,10 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
+    - jsonPath: .status.backup.lastSuccessfulTime
+      name: Last Backup
+      priority: 1
+      type: date
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -1082,6 +1086,141 @@ spec:
                     targetQueueDepth or targetCPUPercent
                   rule: has(self.targetLogEntriesPerSecond) || has(self.targetQueueDepth)
                     || has(self.targetCPUPercent)
+              backup:
+                description: backup turns on scheduled backups. Unset means no backups.
+                  Requires auth.
+                properties:
+                  clusterID:
+                    description: |-
+                      clusterID is stamped into every backup (kahuna.backup_cluster_id). A node seeded from a backup
+                      refuses a backup with a different id. Defaults to <namespace>/<name>. Set it explicitly to
+                      keep the id when you restore the backups into a cluster with a different name.
+                    maxLength: 253
+                    type: string
+                  incrementalSchedule:
+                    description: |-
+                      incrementalSchedule is when to take an incremental backup on top of the latest backup, in the
+                      same format. Unset means full backups only. Each incremental must start within the server's
+                      PITR window (kahuna.pitr_window_seconds, 1 hour by default) of its parent, or the server takes
+                      a full backup in its place.
+                    type: string
+                  macKeySecretRef:
+                    description: |-
+                      macKeySecretRef points at the key that signs every backup manifest
+                      (kahuna.backup_mac_key_file). When unset, the operator generates a random key in a Secret
+                      named <cluster>-backup-mac. That Secret is not deleted with the CamusDBCluster: without the
+                      key the server refuses to restore or seed from the backups it signed.
+                    properties:
+                      key:
+                        description: The key of the secret to select from.  Must be
+                          a valid secret key.
+                        type: string
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                      optional:
+                        description: Specify whether the Secret or its key must be
+                          defined
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  retention:
+                    description: retention bounds how many backups the server keeps.
+                    properties:
+                      maxAge:
+                        description: |-
+                          maxAge deletes a chain when its newest backup is older than this
+                          (kahuna.backup_retention_max_age_seconds). It is rounded down to whole seconds.
+                        type: string
+                      maxBytes:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: |-
+                          maxBytes keeps the newest chains whose combined size stays within this budget
+                          (kahuna.backup_retention_max_bytes).
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      maxChains:
+                        description: maxChains keeps at most this many of the newest
+                          chains (kahuna.backup_retention_max_chains).
+                        format: int32
+                        minimum: 1
+                        type: integer
+                    type: object
+                  schedule:
+                    description: |-
+                      schedule is when to take a full backup, in cron format ("0 2 * * *", "@daily"). Times are UTC
+                      unless the schedule starts with CRON_TZ=<zone>. The first full backup runs as soon as the
+                      cluster is steady after backups are turned on.
+                    minLength: 1
+                    type: string
+                  suspend:
+                    description: suspend stops new scheduled backups. A backup already
+                      running continues.
+                    type: boolean
+                  timeout:
+                    default: 1h
+                    description: |-
+                      timeout bounds one backup request. When it expires the operator cancels the request, and the
+                      server stops the backup without publishing it.
+                    type: string
+                  volume:
+                    description: |-
+                      volume is the shared volume that holds the backups. The server writes them under a
+                      directory named after the cluster, so two clusters can share one claim.
+                    properties:
+                      claim:
+                        description: |-
+                          claim asks the operator to create a PersistentVolumeClaim named <cluster>-backup. Access
+                          modes default to ReadWriteMany, or to ReadWriteOnce for a single-node cluster, so the
+                          StorageClass must support ReadWriteMany when the cluster has more than one node. Until the
+                          claim binds, the operator replaces it when this spec changes. After it binds, the operator
+                          does not change it. Deleting the CamusDBCluster, or removing spec.backup, does not delete the
+                          claim.
+                        properties:
+                          accessModes:
+                            description: accessModes for the claim. Defaults to ReadWriteOnce.
+                            items:
+                              type: string
+                            type: array
+                          size:
+                            anyOf:
+                            - type: integer
+                            - type: string
+                            description: size is the requested capacity for the volume.
+                            pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                            x-kubernetes-int-or-string: true
+                          storageClassName:
+                            description: storageClassName selects the StorageClass.
+                              Unset uses the cluster default.
+                            type: string
+                        required:
+                        - size
+                        type: object
+                      claimName:
+                        description: |-
+                          claimName names an existing PersistentVolumeClaim in the cluster's namespace. It must be
+                          ReadWriteMany when the cluster has more than one node.
+                        minLength: 1
+                        type: string
+                    type: object
+                    x-kubernetes-validations:
+                    - message: exactly one of backup.volume.claimName or backup.volume.claim
+                        must be set
+                      rule: has(self.claimName) != has(self.claim)
+                required:
+                - schedule
+                - volume
+                type: object
               config:
                 description: |-
                   config is merged over the config.yml the operator generates, key by key, and wins on a
@@ -1259,7 +1398,7 @@ spec:
                   type: string
                 type: array
               image:
-                default: camusdb/camusdb:0.15.2
+                default: camusdb/camusdb:0.16.3
                 description: |-
                   image is the CamusDB server image. The operator overrides the image entrypoint with its own
                   generated startup script, so the stock single-node image works unmodified.
@@ -1647,10 +1786,11 @@ spec:
                       factor is the number of voter replicas of each data partition (kahuna.replication_factor).
                       The system partition always spans every node regardless.
 
-                      The server applies the factor only to partitions created while the cluster has more nodes
-                      than the factor, and it never converts a fully replicated partition afterwards. A cluster
-                      created with 3 nodes and factor 3 therefore stays fully replicated; create it with at least
-                      4 nodes to get real placement.
+                      A partition created while the cluster has no more nodes than the factor starts fully
+                      replicated, and so does every partition of a cluster that ran without a factor. CamusDB
+                      0.16.0 and later convert such a partition to a replica set within a few rebalancer passes.
+                      Older servers never convert one: a cluster that they created with 3 nodes and factor 3 stays
+                      fully replicated.
                     format: int32
                     maximum: 3
                     minimum: 1
@@ -2421,6 +2561,67 @@ spec:
                     format: int32
                     type: integer
                 type: object
+              backup:
+                description: backup is the backup scheduler's state. Present only
+                  while spec.backup is set.
+                properties:
+                  consecutiveFailures:
+                    description: consecutiveFailures counts the backups that failed
+                      since the latest success.
+                    format: int32
+                    type: integer
+                  lastBackupID:
+                    description: lastBackupID is the id of the latest backup. The
+                      next incremental uses it as its parent.
+                    type: string
+                  lastBackupType:
+                    description: |-
+                      lastBackupType is Full or Incremental, as the server took it. The server takes a full backup
+                      in place of an incremental one when the incremental cannot continue the chain.
+                    type: string
+                  lastFailureMessage:
+                    description: lastFailureMessage is why the latest failed backup
+                      failed.
+                    type: string
+                  lastFailureTime:
+                    description: lastFailureTime is when the latest failed backup
+                      ended.
+                    format: date-time
+                    type: string
+                  lastFullScheduleTime:
+                    description: |-
+                      lastFullScheduleTime is the scheduled time of the latest full backup that succeeded. The next
+                      full backup is due at the first schedule time after it.
+                    format: date-time
+                    type: string
+                  lastIncrementalScheduleTime:
+                    description: |-
+                      lastIncrementalScheduleTime is the scheduled time of the latest incremental backup that
+                      succeeded, or the time of the latest full backup when that is later.
+                    format: date-time
+                    type: string
+                  lastSuccessfulTime:
+                    description: lastSuccessfulTime is when the latest backup of either
+                      type completed.
+                    format: date-time
+                    type: string
+                  lastUnclaimedTime:
+                    description: |-
+                      lastUnclaimedTime is when the latest unclaimed attempt ended. The next attempt waits a short
+                      delay after it.
+                    format: date-time
+                    type: string
+                  unclaimedSince:
+                    description: |-
+                      unclaimedSince is when the first of the current run of unclaimed attempts ended. An attempt
+                      is unclaimed when no node took it and every node refused with an outcome that clears on its
+                      own: the meta partition has no settled leader yet, leadership moved during the backup, or the
+                      topology moved during the backup. The first is what a cluster looks like right after
+                      bootstrap. An unclaimed attempt is retried soon and is not counted as a failure, until the
+                      run lasts longer than a bound. Cleared by any other result.
+                    format: date-time
+                    type: string
+                type: object
               bootstrapSize:
                 description: |-
                   bootstrapSize is the replica count the cluster was first created at. It is pinned when the
@@ -2496,8 +2697,10 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               currentImage:
-                description: currentImage is the image the fully-rolled-out nodes
-                  are running.
+                description: |-
+                  currentImage is the image that every node runs. It changes to spec.image only when every
+                  node runs that image and is ready. During an image rollout, and when a rollout is stuck,
+                  it keeps the image that the cluster ran before.
                 type: string
               labelSelector:
                 description: labelSelector is the serialized pod selector, required
@@ -2607,6 +2810,9 @@ spec:
         - message: 'autoscaling requires spec.auth: without authentication CamusDB
             serves its engine metrics and the leave call to loopback callers only'
           rule: '!has(self.spec.autoscaling) || has(self.spec.auth)'
+        - message: 'backup requires spec.auth: without authentication CamusDB accepts
+            backup calls from loopback callers only'
+          rule: '!has(self.spec.backup) || has(self.spec.auth)'
     served: true
     storage: true
     subresources:

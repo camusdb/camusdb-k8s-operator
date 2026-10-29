@@ -58,8 +58,9 @@ func rosterMatches(cluster *camusdbv1alpha1.CamusDBCluster, m *camusdb.Membershi
 // buildPlan decides the StatefulSet size and rolling-update partition for this pass.
 //
 // currentReplicas is what the StatefulSet is set to right now (not what it has running), and
-// membership may be nil when no node could be reached.
-func buildPlan(cluster *camusdbv1alpha1.CamusDBCluster, currentReplicas int32, bootstrapped bool, m *camusdb.Membership) plan {
+// membership may be nil when no node could be reached. placement is the committed replica
+// placement, and placementErr is set when it could not be read.
+func buildPlan(cluster *camusdbv1alpha1.CamusDBCluster, currentReplicas int32, bootstrapped bool, m *camusdb.Membership, placement *camusdb.Placement, placementErr error) plan {
 	target := desiredReplicas(cluster)
 
 	// Greenfield: every node must come up at once. Each one blocks until it can form a quorum
@@ -90,6 +91,22 @@ func buildPlan(cluster *camusdbv1alpha1.CamusDBCluster, currentReplicas int32, b
 		p.Partition = currentReplicas
 		p.Reason = rosterHoldReason(cluster, m, currentReplicas)
 		return p
+	}
+
+	// The roster converging says the membership change is committed; the placement says whether
+	// the data has followed. A scale-down that goes ahead while the last node's replicas are
+	// still being repaired onto the survivors takes a second copy away from partitions that have
+	// already lost one, and a scale-up that stacks on moves still in flight only adds backfill
+	// to backfill. A rolling update is not held for this: it changes no membership.
+	if currentReplicas != target {
+		if placementErr != nil {
+			p.Reason = fmt.Sprintf("waiting for replica placement to become readable: %v", placementErr)
+			return p
+		}
+		if _, _, reason := placementSettled(cluster, placement, currentReplicas); reason != "" {
+			p.Reason = "waiting for replica placement to settle: " + reason
+			return p
+		}
 	}
 
 	switch {

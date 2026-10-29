@@ -239,6 +239,87 @@ type NodeStats struct {
 	CPU    *CPUStats `json:"cpu"`
 }
 
+// Backup types reported by the server in BackupInfo.Type.
+const (
+	BackupTypeFull        = "Full"
+	BackupTypeIncremental = "Incremental"
+)
+
+// Error codes the server returns for a refused backup request, in the "code" field of the body.
+// Only the codes the operator acts on are named; the server has more.
+const (
+	// BackupCodeNotConfigured means the node runs without kahuna.backup_dir, which is what a node
+	// not yet restarted with the backup settings looks like.
+	BackupCodeNotConfigured = "CADB0700"
+	// BackupCodeParentMissing means the catalog has no backup with the requested parent id.
+	BackupCodeParentMissing = "CADB0705"
+	// BackupCodeFailed is the server's code for every backup failure it does not classify. It
+	// covers an I/O error, and also a cut that the transactions in flight overtook and a share of
+	// the partitions that one node did not deliver, which CamusDB does not tell apart from the
+	// first.
+	BackupCodeFailed = "CADB0704"
+	// BackupCodeRetryableLeadershipLoss means leadership moved during the backup. Nothing was
+	// published.
+	BackupCodeRetryableLeadershipLoss = "CADB070A"
+	// BackupCodeTopologyChanged means the roster or the partition map moved during the backup.
+	// Nothing was published.
+	BackupCodeTopologyChanged = "CADB070D"
+	// BackupCodeNotCoordinator means the node does not lead the backup meta partition, so it
+	// cannot take a coordinated backup. Another node can.
+	BackupCodeNotCoordinator = "CADB070E"
+)
+
+// BackupInfo is the server's description of one backup (BackupInfoModel). Only the fields the
+// operator uses are decoded.
+type BackupInfo struct {
+	BackupID        string `json:"backupId"`
+	Type            string `json:"type"`
+	ParentBackupID  string `json:"parentBackupId"`
+	ClusterID       string `json:"clusterId"`
+	CoordinatorNode string `json:"coordinatorNode"`
+	// ActualKind differs from the requested kind when the server took a full backup in place of an
+	// incremental one; SubstitutionReason then says why.
+	ActualKind         string `json:"actualKind"`
+	SubstitutionReason string `json:"substitutionReason"`
+}
+
+// BackupError is a backup request the server refused with an error code.
+type BackupError struct {
+	StatusCode int
+	Code       string
+	Message    string
+}
+
+func (e *BackupError) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf("backup refused with HTTP %d (%s)", e.StatusCode, e.Code)
+	}
+	return fmt.Sprintf("backup refused with HTTP %d (%s): %s", e.StatusCode, e.Code, e.Message)
+}
+
+// TryAnotherNode reports whether a different node can still take the backup now. Every other
+// code is a refusal that a different node would repeat.
+func (e *BackupError) TryAnotherNode() bool {
+	switch e.Code {
+	case BackupCodeNotCoordinator, BackupCodeRetryableLeadershipLoss, BackupCodeTopologyChanged,
+		BackupCodeNotConfigured, BackupCodeFailed:
+		return true
+	}
+	return false
+}
+
+// ClearsOnRetry reports whether the same request can succeed later with nothing changed: the
+// refusal comes from a meta partition with no leader yet, a leader that just moved, or a topology
+// that moved during the backup. NotConfigured is not one of these: it needs a restart with the
+// backup settings. Failed is not either, because it can also be an I/O error.
+func (e *BackupError) ClearsOnRetry() bool {
+	switch e.Code {
+	case BackupCodeNotCoordinator, BackupCodeRetryableLeadershipLoss, BackupCodeTopologyChanged:
+		return true
+	}
+	return false
+}
+
 // Credentials authenticate the operator to a cluster with authentication on.
 type Credentials struct {
 	// Realm scopes the cached token. Every node of one cluster shares a token key, so a token from
@@ -264,7 +345,8 @@ type Target struct {
 	Credentials *Credentials
 }
 
-// Client reads cluster state from a CamusDB node, and asks one to decommission itself.
+// Client reads cluster state from a CamusDB node, asks one to decommission itself, and asks one
+// to take a backup.
 type Client interface {
 	// Membership returns the committed roster as seen by the node.
 	Membership(ctx context.Context, t Target) (*Membership, error)
@@ -282,6 +364,12 @@ type Client interface {
 	Metrics(ctx context.Context, t Target) (*Metrics, error)
 	// NodeStats returns the node's disk, CPU and memory state.
 	NodeStats(ctx context.Context, t Target) (*NodeStats, error)
+	// TakeCoordinatedBackup asks the node to take a full backup at one cluster-wide cut. Only the
+	// node that leads the backup meta partition accepts it. A refusal comes back as a *BackupError.
+	TakeCoordinatedBackup(ctx context.Context, t Target) (*BackupInfo, error)
+	// TakeIncrementalBackup asks the node to back up the log written since the parent backup. A
+	// refusal comes back as a *BackupError.
+	TakeIncrementalBackup(ctx context.Context, t Target, parentBackupID string) (*BackupInfo, error)
 }
 
 // Default timeouts. A status read and a leave need different bounds, and one value cannot serve
@@ -466,14 +554,21 @@ func (c *HTTPClient) forgetToken(cr *Credentials) {
 	c.mu.Unlock()
 }
 
-// call sends one request and returns the status code and the body. With credentials a rejected
-// token is renewed once: the server can drop tokens before their stated expiry, for example on a
-// password change.
-func (c *HTTPClient) call(ctx context.Context, t Target, method, path string) (int, []byte, error) {
+// call sends one request and returns the status code and the body. A nil body sends none, and a
+// body is sent as JSON. With credentials a rejected token is renewed once: the server can drop
+// tokens before their stated expiry, for example on a password change.
+func (c *HTTPClient) call(ctx context.Context, t Target, method, path string, body []byte) (int, []byte, error) {
 	for attempt := 0; ; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, method, t.BaseURL+path, nil)
+		var reader io.Reader
+		if body != nil {
+			reader = bytes.NewReader(body)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, t.BaseURL+path, reader)
 		if err != nil {
 			return 0, nil, err
+		}
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
 		}
 		if t.Credentials != nil {
 			tok, err := c.token(ctx, t)
@@ -486,7 +581,7 @@ func (c *HTTPClient) call(ctx context.Context, t Target, method, path string) (i
 		if err != nil {
 			return 0, nil, err
 		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
 		if err != nil {
 			return resp.StatusCode, nil, err
@@ -495,7 +590,7 @@ func (c *HTTPClient) call(ctx context.Context, t Target, method, path string) (i
 			c.forgetToken(t.Credentials)
 			continue
 		}
-		return resp.StatusCode, body, nil
+		return resp.StatusCode, raw, nil
 	}
 }
 
@@ -504,7 +599,7 @@ func (c *HTTPClient) getJSON(ctx context.Context, t Target, path string, out any
 	ctx, cancel := bound(ctx, c.ReadTimeout)
 	defer cancel()
 
-	code, body, err := c.call(ctx, t, http.MethodGet, path)
+	code, body, err := c.call(ctx, t, http.MethodGet, path, nil)
 	if err != nil {
 		return err
 	}
@@ -599,7 +694,7 @@ func (c *HTTPClient) Leave(ctx context.Context, t Target) (*LeaveResult, error) 
 	ctx, cancel := bound(ctx, c.LeaveTimeout)
 	defer cancel()
 
-	code, body, err := c.call(ctx, t, http.MethodPost, "/v1/cluster/leave")
+	code, body, err := c.call(ctx, t, http.MethodPost, "/v1/cluster/leave", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -611,4 +706,49 @@ func (c *HTTPClient) Leave(ctx context.Context, t Target) (*LeaveResult, error) 
 		return nil, statusError("/v1/cluster/leave", code, body)
 	}
 	return &out, nil
+}
+
+// TakeCoordinatedBackup implements Client. It has no timeout of its own: a full backup copies the
+// whole store, so only the caller knows how long to wait for it.
+func (c *HTTPClient) TakeCoordinatedBackup(ctx context.Context, t Target) (*BackupInfo, error) {
+	return c.postBackup(ctx, t, "/v1/backups/coordinated", nil)
+}
+
+// TakeIncrementalBackup implements Client. It is bounded by the caller's context, as above.
+func (c *HTTPClient) TakeIncrementalBackup(ctx context.Context, t Target, parentBackupID string) (*BackupInfo, error) {
+	body, err := json.Marshal(map[string]string{"parentBackupId": parentBackupID})
+	if err != nil {
+		return nil, err
+	}
+	return c.postBackup(ctx, t, "/v1/backups/incremental", body)
+}
+
+// backupResponse is the body of every answer from a backup route.
+type backupResponse struct {
+	Status  string      `json:"status"`
+	Code    string      `json:"code"`
+	Message string      `json:"message"`
+	Backup  *BackupInfo `json:"backup"`
+}
+
+// postBackup sends a backup request. A 200 carries the new backup; every refusal carries an error
+// code, and comes back as a *BackupError.
+func (c *HTTPClient) postBackup(ctx context.Context, t Target, path string, body []byte) (*BackupInfo, error) {
+	code, raw, err := c.call(ctx, t, http.MethodPost, path, body)
+	if err != nil {
+		return nil, err
+	}
+	var out backupResponse
+	// A body that does not decode still leaves the status, which is the answer.
+	_ = json.Unmarshal(raw, &out)
+	if code == http.StatusUnauthorized {
+		return nil, fmt.Errorf("%s: %w", path, ErrUnauthorized)
+	}
+	if code != http.StatusOK || out.Status != "ok" {
+		return nil, &BackupError{StatusCode: code, Code: out.Code, Message: out.Message}
+	}
+	if out.Backup == nil || out.Backup.BackupID == "" {
+		return nil, fmt.Errorf("%s: the response carries no backup id", path)
+	}
+	return out.Backup, nil
 }

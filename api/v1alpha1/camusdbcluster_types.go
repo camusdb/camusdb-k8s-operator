@@ -65,6 +65,13 @@ const (
 	// ConditionAutoscalingLimited is true when the autoscaler wants a size it is not allowed to
 	// reach: a bound, an unreadable signal, or a replication factor the cluster cannot yet honour.
 	ConditionAutoscalingLimited = "AutoscalingLimited"
+	// ConditionBackupFailing is true when the latest scheduled backup failed, or the backup schedule
+	// cannot be parsed. It stays false while backups succeed or wait for the cluster to settle.
+	ConditionBackupFailing = "BackupFailing"
+	// ConditionBackupVolumeReady is true when the backup claim is bound and every node can mount it.
+	// While it is false because the claim is not bound, no pod can start, and the message names the
+	// cause, such as a provisioner that cannot give ReadWriteMany.
+	ConditionBackupVolumeReady = "BackupVolumeReady"
 )
 
 // PVCRetentionPolicy controls what happens to a node's PersistentVolumeClaims when its pod is
@@ -332,14 +339,19 @@ type WorkersSpec struct {
 // data and one more voter on every write — the cluster gets more expensive without getting more
 // write capacity. With it each partition lives on `factor` nodes and the placement rebalancer
 // spreads the partitions across the rest.
+//
+// With it the operator also raises the rebalancer's pacing (kahuna.max_concurrent_replica_transfers
+// 4, kahuna.max_replica_moves_per_pass 8, kahuna.replica_count_deadband 0), so that a node added by
+// a scale-up receives its share of the data in minutes. spec.config overrides any of them.
 type ReplicationSpec struct {
 	// factor is the number of voter replicas of each data partition (kahuna.replication_factor).
 	// The system partition always spans every node regardless.
 	//
-	// The server applies the factor only to partitions created while the cluster has more nodes
-	// than the factor, and it never converts a fully replicated partition afterwards. A cluster
-	// created with 3 nodes and factor 3 therefore stays fully replicated; create it with at least
-	// 4 nodes to get real placement.
+	// A partition created while the cluster has no more nodes than the factor starts fully
+	// replicated, and so does every partition of a cluster that ran without a factor. CamusDB
+	// 0.16.0 and later convert such a partition to a replica set within a few rebalancer passes.
+	// Older servers never convert one: a cluster that they created with 3 nodes and factor 3 stays
+	// fully replicated.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=3
 	// +required
@@ -348,9 +360,12 @@ type ReplicationSpec struct {
 
 // AutoscalingSpec lets the operator choose the node count from traffic.
 //
-// The operator steps one node at a time, and only once the roster has converged on the previous
-// step, so a scale never stacks a second membership change on top of one still in flight. A
-// signal must stay past its target for the whole stabilization window before a step is taken.
+// The operator steps one node at a time, and only once the previous step is complete, so a scale
+// never stacks a second membership change on top of one still in flight. Complete means that the
+// roster has converged and that the replica placement has settled: no replica move is in flight, no
+// replica is left on a node that departed, and every node carries a share of the data partitions.
+// The share is waited for at most five minutes after a step. A signal must stay past its target for
+// the whole stabilization window before a step is taken.
 // +kubebuilder:validation:XValidation:rule="self.maxReplicas >= self.minReplicas",message="autoscaling.maxReplicas must be >= autoscaling.minReplicas"
 // +kubebuilder:validation:XValidation:rule="has(self.targetLogEntriesPerSecond) || has(self.targetQueueDepth) || has(self.targetCPUPercent)",message="autoscaling needs at least one of targetLogEntriesPerSecond, targetQueueDepth or targetCPUPercent"
 type AutoscalingSpec struct {
@@ -409,6 +424,111 @@ type AutoscalingSpec struct {
 	TolerancePercent *int32 `json:"tolerancePercent,omitempty"`
 }
 
+// BackupVolumeSpec selects the volume that holds the backup catalog. Every node mounts the same
+// volume, because the catalog is whatever is in the backup directory: a node finds an incremental's
+// parent, and lists backups, only from there. A volume per node would give each node a partial
+// catalog, and an incremental taken on a node that did not take its parent would fail.
+// +kubebuilder:validation:XValidation:rule="has(self.claimName) != has(self.claim)",message="exactly one of backup.volume.claimName or backup.volume.claim must be set"
+type BackupVolumeSpec struct {
+	// claimName names an existing PersistentVolumeClaim in the cluster's namespace. It must be
+	// ReadWriteMany when the cluster has more than one node.
+	// +kubebuilder:validation:MinLength=1
+	// +optional
+	ClaimName *string `json:"claimName,omitempty"`
+
+	// claim asks the operator to create a PersistentVolumeClaim named <cluster>-backup. Access
+	// modes default to ReadWriteMany, or to ReadWriteOnce for a single-node cluster, so the
+	// StorageClass must support ReadWriteMany when the cluster has more than one node. Until the
+	// claim binds, the operator replaces it when this spec changes. After it binds, the operator
+	// does not change it. Deleting the CamusDBCluster, or removing spec.backup, does not delete the
+	// claim.
+	// +optional
+	Claim *VolumeSpec `json:"claim,omitempty"`
+}
+
+// BackupRetentionSpec bounds how many backups the server keeps. The server deletes whole chains
+// (a full backup and the incrementals on top of it), and always keeps the newest chain. A bound
+// that is not set does not apply. With no bound set, the server keeps every backup.
+type BackupRetentionSpec struct {
+	// maxChains keeps at most this many of the newest chains (kahuna.backup_retention_max_chains).
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxChains *int32 `json:"maxChains,omitempty"`
+
+	// maxAge deletes a chain when its newest backup is older than this
+	// (kahuna.backup_retention_max_age_seconds). It is rounded down to whole seconds.
+	// +optional
+	MaxAge *metav1.Duration `json:"maxAge,omitempty"`
+
+	// maxBytes keeps the newest chains whose combined size stays within this budget
+	// (kahuna.backup_retention_max_bytes).
+	// +optional
+	MaxBytes *resource.Quantity `json:"maxBytes,omitempty"`
+}
+
+// BackupSpec turns on scheduled backups to a volume that every node shares.
+//
+// Full backups are coordinated: the server takes them at one cut time that is the same for every
+// partition. Incremental backups add the log written since the latest backup. Under a replication
+// factor no node needs to host every partition: CamusDB 0.16.0 and later compose the backup from
+// each node's share of the partitions, so it covers every partition. An older server's backup
+// holds only the partitions that the node taking it hosts, and restore and seeding refuse it, so
+// the operator takes no backup when spec.image names a release before 0.16.0 and the cluster can
+// have more nodes than the factor.
+//
+// Backups need spec.auth: without authentication CamusDB accepts backup calls from loopback only.
+//
+// Adding, removing or changing anything here except the schedules, suspend and timeout changes the
+// generated config.yml, which rolls the cluster one node at a time.
+type BackupSpec struct {
+	// schedule is when to take a full backup, in cron format ("0 2 * * *", "@daily"). Times are UTC
+	// unless the schedule starts with CRON_TZ=<zone>. The first full backup runs as soon as the
+	// cluster is steady after backups are turned on.
+	// +kubebuilder:validation:MinLength=1
+	// +required
+	Schedule string `json:"schedule"`
+
+	// incrementalSchedule is when to take an incremental backup on top of the latest backup, in the
+	// same format. Unset means full backups only. Each incremental must start within the server's
+	// PITR window (kahuna.pitr_window_seconds, 1 hour by default) of its parent, or the server takes
+	// a full backup in its place.
+	// +optional
+	IncrementalSchedule string `json:"incrementalSchedule,omitempty"`
+
+	// suspend stops new scheduled backups. A backup already running continues.
+	// +optional
+	Suspend *bool `json:"suspend,omitempty"`
+
+	// timeout bounds one backup request. When it expires the operator cancels the request, and the
+	// server stops the backup without publishing it.
+	// +kubebuilder:default="1h"
+	// +optional
+	Timeout *metav1.Duration `json:"timeout,omitempty"`
+
+	// volume is the shared volume that holds the backups. The server writes them under a
+	// directory named after the cluster, so two clusters can share one claim.
+	// +required
+	Volume BackupVolumeSpec `json:"volume"`
+
+	// clusterID is stamped into every backup (kahuna.backup_cluster_id). A node seeded from a backup
+	// refuses a backup with a different id. Defaults to <namespace>/<name>. Set it explicitly to
+	// keep the id when you restore the backups into a cluster with a different name.
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	ClusterID string `json:"clusterID,omitempty"`
+
+	// macKeySecretRef points at the key that signs every backup manifest
+	// (kahuna.backup_mac_key_file). When unset, the operator generates a random key in a Secret
+	// named <cluster>-backup-mac. That Secret is not deleted with the CamusDBCluster: without the
+	// key the server refuses to restore or seed from the backups it signed.
+	// +optional
+	MACKeySecretRef *corev1.SecretKeySelector `json:"macKeySecretRef,omitempty"`
+
+	// retention bounds how many backups the server keeps.
+	// +optional
+	Retention *BackupRetentionSpec `json:"retention,omitempty"`
+}
+
 // CamusDBClusterSpec defines the desired state of a CamusDB cluster.
 type CamusDBClusterSpec struct {
 	// replicas is the number of CamusDB nodes. Raft needs an odd count for a clean majority;
@@ -442,6 +562,10 @@ type CamusDBClusterSpec struct {
 	// +optional
 	Auth *AuthSpec `json:"auth,omitempty"`
 
+	// backup turns on scheduled backups. Unset means no backups. Requires auth.
+	// +optional
+	Backup *BackupSpec `json:"backup,omitempty"`
+
 	// image is the CamusDB server image. The operator overrides the image entrypoint with its own
 	// generated startup script, so the stock single-node image works unmodified.
 	//
@@ -449,7 +573,7 @@ type CamusDBClusterSpec struct {
 	// image moves on its own re-rolls every node on a registry push, and the generated command
 	// line is version-specific: a flag the new server no longer accepts stops the node at
 	// startup. Raise this default deliberately, once the flags are checked against that release.
-	// +kubebuilder:default="camusdb/camusdb:0.15.2"
+	// +kubebuilder:default="camusdb/camusdb:0.16.3"
 	// +optional
 	Image string `json:"image,omitempty"`
 
@@ -645,6 +769,59 @@ type AutoscalingStatus struct {
 	LastScaleTime *metav1.Time `json:"lastScaleTime,omitempty"`
 }
 
+// BackupStatus is the backup scheduler's memory between reconciles. A schedule time advances only
+// when its backup succeeds, so a failed backup stays due and is retried with a backoff.
+type BackupStatus struct {
+	// lastFullScheduleTime is the scheduled time of the latest full backup that succeeded. The next
+	// full backup is due at the first schedule time after it.
+	// +optional
+	LastFullScheduleTime *metav1.Time `json:"lastFullScheduleTime,omitempty"`
+
+	// lastIncrementalScheduleTime is the scheduled time of the latest incremental backup that
+	// succeeded, or the time of the latest full backup when that is later.
+	// +optional
+	LastIncrementalScheduleTime *metav1.Time `json:"lastIncrementalScheduleTime,omitempty"`
+
+	// lastSuccessfulTime is when the latest backup of either type completed.
+	// +optional
+	LastSuccessfulTime *metav1.Time `json:"lastSuccessfulTime,omitempty"`
+
+	// lastBackupID is the id of the latest backup. The next incremental uses it as its parent.
+	// +optional
+	LastBackupID string `json:"lastBackupID,omitempty"`
+
+	// lastBackupType is Full or Incremental, as the server took it. The server takes a full backup
+	// in place of an incremental one when the incremental cannot continue the chain.
+	// +optional
+	LastBackupType string `json:"lastBackupType,omitempty"`
+
+	// consecutiveFailures counts the backups that failed since the latest success.
+	// +optional
+	ConsecutiveFailures int32 `json:"consecutiveFailures,omitempty"`
+
+	// lastFailureTime is when the latest failed backup ended.
+	// +optional
+	LastFailureTime *metav1.Time `json:"lastFailureTime,omitempty"`
+
+	// lastFailureMessage is why the latest failed backup failed.
+	// +optional
+	LastFailureMessage string `json:"lastFailureMessage,omitempty"`
+
+	// unclaimedSince is when the first of the current run of unclaimed attempts ended. An attempt
+	// is unclaimed when no node took it and every node refused with an outcome that clears on its
+	// own: the meta partition has no settled leader yet, leadership moved during the backup, or the
+	// topology moved during the backup. The first is what a cluster looks like right after
+	// bootstrap. An unclaimed attempt is retried soon and is not counted as a failure, until the
+	// run lasts longer than a bound. Cleared by any other result.
+	// +optional
+	UnclaimedSince *metav1.Time `json:"unclaimedSince,omitempty"`
+
+	// lastUnclaimedTime is when the latest unclaimed attempt ended. The next attempt waits a short
+	// delay after it.
+	// +optional
+	LastUnclaimedTime *metav1.Time `json:"lastUnclaimedTime,omitempty"`
+}
+
 // CamusDBClusterStatus defines the observed state of a CamusDB cluster.
 type CamusDBClusterStatus struct {
 	// observedGeneration is the spec generation this status reflects.
@@ -693,7 +870,9 @@ type CamusDBClusterStatus struct {
 	// +optional
 	BootstrapSize int32 `json:"bootstrapSize,omitempty"`
 
-	// currentImage is the image the fully-rolled-out nodes are running.
+	// currentImage is the image that every node runs. It changes to spec.image only when every
+	// node runs that image and is ready. During an image rollout, and when a rollout is stuck,
+	// it keeps the image that the cluster ran before.
 	// +optional
 	CurrentImage string `json:"currentImage,omitempty"`
 
@@ -710,6 +889,10 @@ type CamusDBClusterStatus struct {
 	// +optional
 	Autoscaling *AutoscalingStatus `json:"autoscaling,omitempty"`
 
+	// backup is the backup scheduler's state. Present only while spec.backup is set.
+	// +optional
+	Backup *BackupStatus `json:"backup,omitempty"`
+
 	// conditions represent the current state of the CamusDBCluster resource.
 	// +listType=map
 	// +listMapKey=type
@@ -724,6 +907,7 @@ type CamusDBClusterStatus struct {
 // +kubebuilder:validation:XValidation:rule="(oldSelf.spec.replicas == 1) == (self.spec.replicas == 1)",message="a single-node cluster cannot be scaled into a multi-node cluster, or vice versa. Create a new CamusDBCluster and migrate the data."
 // +kubebuilder:validation:XValidation:rule="!has(self.spec.autoscaling) || has(self.spec.replication)",message="autoscaling requires spec.replication: without a replication factor every node holds every partition, so adding nodes adds copies rather than capacity"
 // +kubebuilder:validation:XValidation:rule="!has(self.spec.autoscaling) || has(self.spec.auth)",message="autoscaling requires spec.auth: without authentication CamusDB serves its engine metrics and the leave call to loopback callers only"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.backup) || has(self.spec.auth)",message="backup requires spec.auth: without authentication CamusDB accepts backup calls from loopback callers only"
 // +kubebuilder:resource:shortName=camusdb;cdb
 // +kubebuilder:printcolumn:name="Desired",type=integer,JSONPath=`.spec.replicas`
 // +kubebuilder:printcolumn:name="Autoscaled",type=integer,JSONPath=`.status.autoscaling.desiredReplicas`
@@ -731,6 +915,7 @@ type CamusDBClusterStatus struct {
 // +kubebuilder:printcolumn:name="Voters",type=integer,JSONPath=`.status.voters`
 // +kubebuilder:printcolumn:name="Roster",type=integer,JSONPath=`.status.membershipVersion`,priority=1
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Last Backup",type=date,JSONPath=`.status.backup.lastSuccessfulTime`,priority=1
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // CamusDBCluster is the Schema for the camusdbclusters API

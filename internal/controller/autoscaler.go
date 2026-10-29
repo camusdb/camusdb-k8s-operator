@@ -57,7 +57,19 @@ const (
 	defaultScaleUpStabilization   = 60 * time.Second
 	defaultScaleDownStabilization = 300 * time.Second
 	defaultTolerancePercent       = 10
+
+	// placementSettleTimeout bounds how long a step waits for the rebalancer to give every node its
+	// share of the data partitions. The wait exists because a node that holds nothing adds no
+	// capacity and reads zero traffic, which drags the per-node average down just when it should
+	// not. The bound exists because the server's planner stops at its own notion of even — a
+	// cluster with fewer placed replicas than it has nodes leaves a node empty for good — and the
+	// autoscaler must not hang on that. Moves still in flight are never waited out by this clock.
+	placementSettleTimeout = 5 * time.Minute
 )
+
+// replicaRoleVoter is the settled role of a replica in GET /v1/cluster/placement. Any other role
+// is a move in flight.
+const replicaRoleVoter = "Voter"
 
 // podSample is the last counter reading taken from one pod.
 type podSample struct {
@@ -383,39 +395,91 @@ func decideAutoscale(in autoscaleInput) autoscaleDecision {
 // growthCeiling decides how far the cluster may grow while still honouring the replication cap.
 //
 // A data partition with no replica set lives on every node, so each node added is another copy of
-// it. The server never converts such a partition to a placed one, so the only way to keep it at or
-// below maxReplicationFactor copies is to not grow past that many nodes.
-func (r *CamusDBClusterReconciler) growthCeiling(ctx context.Context, cluster *camusdbv1alpha1.CamusDBCluster, acc *nodeAccess, pods []corev1.Pod, current int32) (int32, string) {
-	var lastErr error
-	for i := range pods {
-		pod := &pods[i]
-		if pod.Status.PodIP == "" || pod.DeletionTimestamp != nil || !podIsReady(pod) {
+// it. CamusDB 0.16.0 and later convert such a partition to a placed one within a few rebalancer
+// passes, after which this ceiling lifts by itself; an older server never does. Until then the only
+// way to keep it at or below maxReplicationFactor copies is to not grow past that many nodes.
+func growthCeiling(p *camusdb.Placement) (int32, string) {
+	if full := p.FullyReplicated(); len(full) > 0 {
+		return maxReplicationFactor, fmt.Sprintf(
+			"partitions %v are fully replicated, so growing past %d nodes would exceed %d copies; "+
+				"CamusDB 0.16.0 or later converts them shortly after start; an older server needs a cluster "+
+				"created with more nodes than its replication factor",
+			full, maxReplicationFactor, maxReplicationFactor)
+	}
+	return 0, ""
+}
+
+// placementSettled reports whether the server has finished acting on the last membership change:
+// no replica is in a transitional role, and no replica sits on a node that is no longer a member.
+// Both hold while the server is still moving data, so both are waited for as long as they hold.
+// Replicas are counted per current member on the way, for the share check that builds on this.
+func placementSettled(cluster *camusdbv1alpha1.CamusDBCluster, p *camusdb.Placement, current int32) (hosted map[string]int, total int, reason string) {
+	hosted = make(map[string]int, current)
+	if p == nil {
+		return hosted, 0, ""
+	}
+	members := make(map[string]bool, current)
+	for i := range current {
+		members[raftEndpoint(cluster, i)] = true
+	}
+	var inFlight, stranded []int32
+	for _, part := range p.Partitions {
+		// Partitions without a replica set are on every node; there is nothing to settle.
+		if part.State != camusdb.PartitionStateActive || len(part.Replicas) == 0 {
 			continue
 		}
-		p, err := r.CamusDB.Placement(ctx, acc.target(cluster, pod))
-		if err != nil {
-			lastErr = err
-			continue
+		for _, rep := range part.Replicas {
+			switch {
+			case rep.Role != replicaRoleVoter:
+				inFlight = append(inFlight, part.PartitionID)
+			case !members[rep.Endpoint]:
+				stranded = append(stranded, part.PartitionID)
+			default:
+				hosted[rep.Endpoint]++
+				total++
+			}
 		}
-		if full := p.FullyReplicated(); len(full) > 0 {
-			return maxReplicationFactor, fmt.Sprintf(
-				"partitions %v are fully replicated, so growing past %d nodes would exceed %d copies; "+
-					"the cluster must be created with more nodes than its replication factor",
-				full, maxReplicationFactor, maxReplicationFactor)
+	}
+	switch {
+	case len(inFlight) > 0:
+		return hosted, total, fmt.Sprintf("replica moves in flight on partitions %v", inFlight)
+	case len(stranded) > 0:
+		return hosted, total, fmt.Sprintf("partitions %v still have replicas on nodes that left", stranded)
+	}
+	return hosted, total, ""
+}
+
+// placementConverged is placementSettled plus the autoscaler's own requirement that every node
+// carries a reasonable share of the data partitions. The roster converging says the membership
+// change is committed; this says the data has followed it, which is what makes a node added for
+// capacity actually carry some. The share is what the rebalancer is for, but its planner stops at
+// its own notion of even, so that part is only waited for until settleBy.
+func placementConverged(cluster *camusdbv1alpha1.CamusDBCluster, p *camusdb.Placement, current int32, now time.Time, settleBy *time.Time) (bool, string) {
+	hosted, total, reason := placementSettled(cluster, p, current)
+	if reason != "" {
+		return false, reason
+	}
+	// With fewer placed replicas than nodes some node has to be empty, so there is no share to
+	// wait for; the same goes once the settle clock has run out.
+	share := total / int(current)
+	if share == 0 || (settleBy != nil && !now.Before(*settleBy)) {
+		return true, ""
+	}
+	// Half the even share is deliberately lax: the planner leaves counts uneven whenever the
+	// replicas do not divide by the nodes, and this only has to tell "carrying data" from "empty".
+	minShare := max(1, share/2)
+	for i := range current {
+		if n := hosted[raftEndpoint(cluster, i)]; n < minShare {
+			return false, fmt.Sprintf("%s holds %d of the %d data replicas it should carry",
+				podName(cluster, i), n, share)
 		}
-		return 0, ""
 	}
-	// Not knowing whether growth would add copies is a reason not to grow.
-	reason := "replica placement could not be read, so the cluster is not grown"
-	if lastErr != nil {
-		reason = fmt.Sprintf("%s: %v", reason, lastErr)
-	}
-	return current, reason
+	return true, ""
 }
 
 // reconcileAutoscaling updates the autoscaler state in cluster.Status. The caller persists it with
 // the rest of status; every other step of the pass then reads the new size through desiredReplicas.
-func (r *CamusDBClusterReconciler) reconcileAutoscaling(ctx context.Context, cluster *camusdbv1alpha1.CamusDBCluster, acc *nodeAccess, bootstrapped bool, membership *camusdb.Membership, pods []corev1.Pod) {
+func (r *CamusDBClusterReconciler) reconcileAutoscaling(ctx context.Context, cluster *camusdbv1alpha1.CamusDBCluster, acc *nodeAccess, bootstrapped bool, membership *camusdb.Membership, placement *camusdb.Placement, placementErr error, pods []corev1.Pod) {
 	key := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}
 	spec := cluster.Spec.Autoscaling
 	if spec == nil {
@@ -440,12 +504,32 @@ func (r *CamusDBClusterReconciler) reconcileAutoscaling(ctx context.Context, clu
 			readyCount++
 		}
 	}
+	now := time.Now()
 	// A nil acc means the access data could not be loaded, and so neither could the roster.
-	converged := acc != nil && bootstrapped && rosterMatches(cluster, membership, current) && readyCount == current
+	rosterDone := acc != nil && bootstrapped && rosterMatches(cluster, membership, current) && readyCount == current
 	// Everything below the newest node is in place and the newest node is not in the roster. A
 	// node still catching up is in the roster as a Learner, so a slow join is not mistaken for this.
-	joinPending := !converged && acc != nil && bootstrapped && current > 1 &&
+	joinPending := !rosterDone && acc != nil && bootstrapped && current > 1 &&
 		rosterMatches(cluster, membership, current-1) && readyCount == current-1
+
+	// The roster says the step is committed; the placement says whether the data has followed.
+	// Until it has, the previous step is still in progress and the next must not stack on it.
+	converged := rosterDone
+	waiting := ""
+	if rosterDone {
+		switch {
+		case placementErr != nil:
+			// Not knowing whether the data has settled is a reason to wait, same as for growth.
+			converged = false
+			waiting = fmt.Sprintf("replica placement could not be read: %v", placementErr)
+		default:
+			var settleBy *time.Time
+			if as := cluster.Status.Autoscaling; as != nil && as.LastScaleTime != nil {
+				settleBy = ptr.To(as.LastScaleTime.Add(placementSettleTimeout))
+			}
+			converged, waiting = placementConverged(cluster, placement, current, now, settleBy)
+		}
+	}
 
 	in := autoscaleInput{
 		spec:        spec,
@@ -453,7 +537,7 @@ func (r *CamusDBClusterReconciler) reconcileAutoscaling(ctx context.Context, clu
 		initial:     initialAutoscaledReplicas(cluster),
 		converged:   converged,
 		joinPending: joinPending,
-		now:         time.Now(),
+		now:         now,
 	}
 	if joinPending {
 		newest := podName(cluster, current-1)
@@ -474,14 +558,18 @@ func (r *CamusDBClusterReconciler) reconcileAutoscaling(ctx context.Context, clu
 		}
 	}
 	if converged {
-		in.growthCeiling, in.ceilingReason = r.growthCeiling(ctx, cluster, acc, members, current)
+		in.growthCeiling, in.ceilingReason = growthCeiling(placement)
 	}
 
 	d := decideAutoscale(in)
-	if measureErr != nil {
+	switch {
+	case measureErr != nil:
 		// More specific than the decision's own "no signal" explanation, and the thing to fix.
 		d.limited = true
 		d.reason = fmt.Sprintf("traffic metrics could not be read: %v", measureErr)
+	case waiting != "":
+		// Not a limit either: the data is still following the last step.
+		d.reason = "waiting for replica placement to settle: " + waiting
 	}
 
 	if d.status.DesiredReplicas != current {
