@@ -80,8 +80,10 @@ const (
 type PVCRetentionPolicy string
 
 const (
-	// PVCRetentionRetain keeps the PVCs so a re-scale-up reuses the data (and stays above the
-	// Raft compaction floor). This is the default: deleting a Raft node's data is not reversible.
+	// PVCRetentionRetain keeps a scaled-away node's PVCs until the operator adds that ordinal
+	// again. The operator deletes them then, before it creates the pod: a node that left cannot
+	// rejoin on its old data, so it joins with new volumes and is backfilled. Until then the data
+	// stays available to inspect or copy. This is the default.
 	PVCRetentionRetain PVCRetentionPolicy = "Retain"
 	// PVCRetentionDelete reclaims the volumes when the node is scaled away.
 	PVCRetentionDelete PVCRetentionPolicy = "Delete"
@@ -157,7 +159,10 @@ type StorageSpec struct {
 	// +optional
 	SharedMemtableBudgetMB *int32 `json:"sharedMemtableBudgetMB,omitempty"`
 
-	// pvcRetentionPolicy decides whether a scaled-away node's volumes are kept or deleted.
+	// pvcRetentionPolicy decides when a scaled-away node's volumes are deleted. Retain keeps them
+	// until a scale-up adds the node's ordinal again; Delete deletes them as the node is removed.
+	// Either way a node added back starts on new volumes, because a node that left the cluster
+	// cannot rejoin on its old data.
 	// +kubebuilder:default=Retain
 	// +optional
 	PVCRetentionPolicy PVCRetentionPolicy `json:"pvcRetentionPolicy,omitempty"`

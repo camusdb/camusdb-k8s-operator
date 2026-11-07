@@ -45,6 +45,7 @@ const (
 	keyKahuna       = "kahuna"
 	pemCertificate  = "CERTIFICATE"
 	addedPod        = "camus-4"
+	foundingPod     = "camus-1"
 )
 
 func testCluster(replicas int32) *camusdbv1alpha1.CamusDBCluster {
@@ -273,26 +274,39 @@ func TestEntrypointJoinMode(t *testing.T) {
 		bootstrapSize int32
 		pod           string
 		opts          entrypointOptions
-		wantJoin      bool
+		// bootstrapped marks the cluster's first roster as committed.
+		bootstrapped bool
+		wantJoin     bool
 	}{
 		// A founding node forms the cluster through static discovery. --join-existing here could
 		// fork it into a second roster.
-		{"founding node, greenfield", 3, 3, "camus-0", entrypointOptions{}, false},
-		// Still a founding node even after the cluster grew, so it must never switch modes.
-		{"founding node after scale up", 5, 3, "camus-1", entrypointOptions{}, false},
+		{"founding node, greenfield", 3, 3, "camus-0", entrypointOptions{}, false, false},
+		// Still a founding node even after the cluster grew.
+		{"founding node after scale up", 5, 3, foundingPod, entrypointOptions{}, false, false},
+		{"founding node, restart with data", 5, 3, foundingPod, entrypointOptions{kvData: true}, true, false},
+		// Its volume was lost once the cluster was running: forming a roster again would be wrong.
+		{"founding node, lost volume", 3, 3, foundingPod, entrypointOptions{}, true, true},
 		// Added after the cluster was running: it must enter as a Learner via the seeds.
-		{"added node, empty volume", 5, 3, addedPod, entrypointOptions{}, true},
+		{"added node, empty volume", 5, 3, addedPod, entrypointOptions{}, true, true},
+		// The ordinal alone marks it as added, even before the operator has seen the roster.
+		{"added node, empty volume, bootstrap not yet seen", 5, 3, addedPod, entrypointOptions{}, false, true},
 		// A dedicated WAL volume makes the data directory non-empty on a brand-new node; the key/value
 		// directory is what decides.
-		{"added node, empty volume beside a WAL volume", 5, 3, addedPod, entrypointOptions{walOnly: true}, true},
+		{"added node, empty volume beside a WAL volume", 5, 3, addedPod, entrypointOptions{walOnly: true}, true, true},
 		// Already a member: it replays its WAL and rejoins its partitions, so asking it to
 		// re-admit itself is wrong.
-		{"added node, restart with data", 5, 3, addedPod, entrypointOptions{kvData: true}, false},
+		{"added node, restart with data", 5, 3, addedPod, entrypointOptions{kvData: true}, true, false},
+		// A founding ordinal added back after a scale below the founding size. Static discovery
+		// would have it found a roster the cluster already has; it must join instead.
+		{"founding ordinal added back, empty volume", 4, 5, "camus-3", entrypointOptions{}, true, true},
+		{"founding ordinal added back, empty volume beside a WAL volume", 4, 5, "camus-3", entrypointOptions{walOnly: true}, true, true},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			args := mustRun(t, testCluster(tc.replicas), tc.bootstrapSize, tc.pod, tc.opts).args
+			cluster := testCluster(tc.replicas)
+			cluster.Status.Bootstrapped = tc.bootstrapped
+			args := mustRun(t, cluster, tc.bootstrapSize, tc.pod, tc.opts).args
 			got := argValues(args, flagJoin)
 			if tc.wantJoin {
 				// CamusDB's --join-existing takes a value; the bare flag is a parse error.
@@ -533,10 +547,15 @@ func TestConfigHashChangesWithConfiguration(t *testing.T) {
 
 // The topology file is what carries the replica count to the pod.
 func TestTopologyEnvCarriesReplicasAndBootstrapSize(t *testing.T) {
-	got := topologyEnv(testCluster(5), 3)
-	for _, want := range []string{"REPLICAS=5", "BOOTSTRAP_SIZE=3"} {
+	cluster := testCluster(5)
+	got := topologyEnv(cluster, 3)
+	for _, want := range []string{"REPLICAS=5", "BOOTSTRAP_SIZE=3", "BOOTSTRAPPED=0"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("topology.env missing %q:\n%s", want, got)
 		}
+	}
+	cluster.Status.Bootstrapped = true
+	if got := topologyEnv(cluster, 3); !strings.Contains(got, "BOOTSTRAPPED=1") {
+		t.Errorf("topology.env of a bootstrapped cluster missing BOOTSTRAPPED=1:\n%s", got)
 	}
 }

@@ -356,6 +356,19 @@ func (r *CamusDBClusterReconciler) reconcileStatefulSet(ctx context.Context, clu
 		}
 	}
 
+	// Growing re-adds an ordinal that may have been a member before. Its old volumes would bring it
+	// back as that member, which the cluster no longer accepts, so they are deleted first.
+	if ordinal := currentReplicas; bootstrapped && p.Replicas > currentReplicas {
+		cleared, reason, err := r.clearDepartedVolumes(ctx, cluster, membership, pods, ordinal)
+		if err != nil {
+			return nil, err
+		}
+		if !cleared {
+			p.Replicas = currentReplicas
+			p.Reason = reason
+		}
+	}
+
 	// A keystore that vanished from a running cluster keeps its last digest. Restarting nodes onto
 	// a missing Secret would take them down without a way back; KeystoreReady reports the problem.
 	digest := keystore.digest

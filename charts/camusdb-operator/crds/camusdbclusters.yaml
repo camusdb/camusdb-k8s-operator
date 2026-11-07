@@ -2097,8 +2097,11 @@ spec:
                     type: boolean
                   pvcRetentionPolicy:
                     default: Retain
-                    description: pvcRetentionPolicy decides whether a scaled-away
-                      node's volumes are kept or deleted.
+                    description: |-
+                      pvcRetentionPolicy decides when a scaled-away node's volumes are deleted. Retain keeps them
+                      until a scale-up adds the node's ordinal again; Delete deletes them as the node is removed.
+                      Either way a node added back starts on new volumes, because a node that left the cluster
+                      cannot rejoin on its old data.
                     enum:
                     - Retain
                     - Delete

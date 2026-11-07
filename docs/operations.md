@@ -49,8 +49,11 @@ kubectl -n camusdb logs camusdb-0 --tail=100
 
 - Each node keeps its data on its own volume, at `/storage/data`.
 - `storage.wal` puts the Raft log on a separate volume.
-- `storage.pvcRetentionPolicy` decides what happens to a removed node's volume: `Retain` (default)
-  or `Delete`.
+- `storage.pvcRetentionPolicy` decides when a removed node's volumes are deleted. With `Retain`
+  (default) they stay until a scale-up adds that node back, so you can still read them. The
+  operator then deletes them before it starts the new pod. With `Delete` they go when the node is
+  removed. A node that left cannot rejoin on its old data, so a node added back always starts on
+  new volumes.
 - Deleting the cluster never deletes the volumes.
 - Changing `storage.data.size` does not resize existing volumes.
 

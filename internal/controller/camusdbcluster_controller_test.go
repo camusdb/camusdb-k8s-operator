@@ -661,6 +661,104 @@ var _ = Describe("CamusDBCluster Controller", func() {
 		Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)))
 	})
 
+	It("deletes the volumes a departed node left before adding its ordinal back", func() {
+		reconcileWith(rosterOf(cluster, 3), nil)
+		Expect(getCluster().Status.Bootstrapped).To(BeTrue())
+
+		// What a node that was at ordinal 3 and left leaves behind under the Retain policy.
+		claimKeys := make([]types.NamespacedName, 0, 2)
+		for _, claimName := range nodeClaimNames(cluster, 3) {
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: claimName, Namespace: namespace},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, pvc)).To(Succeed())
+			claimKeys = append(claimKeys, types.NamespacedName{Name: claimName, Namespace: namespace})
+		}
+		// The departed node's pod is still terminating.
+		oldPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: podName(cluster, 3), Namespace: namespace, Labels: selectorLabels(cluster)},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: containerName, Image: testDevImage}}},
+		}
+		Expect(k8sClient.Create(ctx, oldPod)).To(Succeed())
+
+		obj := getCluster()
+		obj.Spec.Replicas = ptr.To(int32(4))
+		Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+
+		// While the old pod exists its volumes are left alone, and the ordinal is not added.
+		reconcileWith(rosterOf(cluster, 3), nil)
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(3)))
+		for _, key := range claimKeys {
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, key, pvc)).To(Succeed())
+			Expect(pvc.DeletionTimestamp).To(BeNil(), "deleted %s while its pod still existed", key.Name)
+		}
+
+		Expect(k8sClient.Delete(ctx, oldPod, client.GracePeriodSeconds(0))).To(Succeed())
+		Eventually(func() bool {
+			return apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(oldPod), &corev1.Pod{}))
+		}).Should(BeTrue())
+
+		// The volumes are deleted, and the ordinal waits until they are gone: a pod created now
+		// would wait on a claim that is being deleted.
+		reconcileWith(rosterOf(cluster, 3), nil)
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(3)))
+		for _, key := range claimKeys {
+			pvc := &corev1.PersistentVolumeClaim{}
+			err := k8sClient.Get(ctx, key, pvc)
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pvc.DeletionTimestamp).NotTo(BeNil(), "left %s in place", key.Name)
+			// envtest runs no controller to release the protection finalizer.
+			pvc.Finalizers = nil
+			Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
+		}
+		Eventually(func() bool {
+			for _, key := range claimKeys {
+				if !apierrors.IsNotFound(k8sClient.Get(ctx, key, &corev1.PersistentVolumeClaim{})) {
+					return false
+				}
+			}
+			return true
+		}).Should(BeTrue())
+
+		fake := reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 3)})
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)))
+		Expect(fake.leaveCalls).To(BeEmpty())
+	})
+
+	It("leaves the volumes of the existing nodes alone when it grows", func() {
+		reconcileWith(rosterOf(cluster, 3), nil)
+		keep := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeClaimNames(cluster, 2)[0], Namespace: namespace},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, keep)).To(Succeed())
+
+		obj := getCluster()
+		obj.Spec.Replicas = ptr.To(int32(4))
+		Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+		reconcileWith(rosterOf(cluster, 3), nil)
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)))
+
+		got := &corev1.PersistentVolumeClaim{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(keep), got)).To(Succeed())
+		Expect(got.DeletionTimestamp).To(BeNil())
+	})
+
 	It("holds every node in place while the roster cannot be read", func() {
 		reconcileWith(rosterOf(cluster, 3), nil)
 

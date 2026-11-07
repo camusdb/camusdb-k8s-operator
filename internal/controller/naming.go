@@ -165,6 +165,14 @@ func podName(cluster *camusdbv1alpha1.CamusDBCluster, ordinal int32) string {
 	return fmt.Sprintf("%s-%d", stsName(cluster), ordinal)
 }
 
+// nodeClaimNames are the PersistentVolumeClaims the StatefulSet makes for the pod at an ordinal,
+// named <template>-<pod> as the StatefulSet controller names them. The WAL claim is listed even
+// when spec.storage.wal is unset, so a claim left from a template that had one is found too.
+func nodeClaimNames(cluster *camusdbv1alpha1.CamusDBCluster, ordinal int32) []string {
+	pod := podName(cluster, ordinal)
+	return []string{dataVolumeName + "-" + pod, walVolumeName + "-" + pod}
+}
+
 // peerDomain is the DNS suffix shared by every pod of the cluster.
 func peerDomain(cluster *camusdbv1alpha1.CamusDBCluster) string {
 	return fmt.Sprintf("%s.%s.svc.cluster.local", peerServiceName(cluster), cluster.Namespace)

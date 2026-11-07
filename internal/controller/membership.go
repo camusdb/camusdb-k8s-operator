@@ -27,7 +27,9 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	camusdbv1alpha1 "github.com/camusdb/k8s-operator/api/v1alpha1"
@@ -296,4 +298,54 @@ func (r *CamusDBClusterReconciler) decommission(ctx context.Context, cluster *ca
 		return false, fmt.Sprintf("%s refused to leave: %s", name, result.Reason)
 	}
 	return false, fmt.Sprintf("waiting for %s to leave the cluster: %s", name, result.Reason)
+}
+
+// clearDepartedVolumes deletes the volumes a node left behind at an ordinal the operator is about
+// to add again, and reports whether the ordinal is clear to add.
+//
+// A node that left the cluster cannot come back on its old data. It starts as the member it was,
+// while the cluster has removed it for good, so it waits for a leader that never answers it and
+// the scale-up never finishes. A node that starts with no data joins as a new Learner and is
+// backfilled instead. The old data holds nothing the cluster still needs: the node is out of the
+// committed roster, and the operator takes no step until the placement has settled without it.
+//
+// Volumes are only deleted for an ordinal that has no pod and that the roster does not list.
+// Returning false holds the scale-up until the deletion has finished, because a pod created while
+// its claim is still being deleted would wait on it.
+func (r *CamusDBClusterReconciler) clearDepartedVolumes(ctx context.Context, cluster *camusdbv1alpha1.CamusDBCluster, m *camusdb.Membership, pods []corev1.Pod, ordinal int32) (bool, string, error) {
+	log := logf.FromContext(ctx)
+	name := podName(cluster, ordinal)
+	if m == nil || m.Contains(raftEndpoint(cluster, ordinal)) {
+		return false, fmt.Sprintf("waiting for the roster to show that %s is not a member", name), nil
+	}
+	for i := range pods {
+		if pods[i].Name == name {
+			return false, fmt.Sprintf("waiting for the old pod %s to be removed", name), nil
+		}
+	}
+
+	clear := true
+	for _, claimName := range nodeClaimNames(cluster, ordinal) {
+		pvc := &corev1.PersistentVolumeClaim{}
+		err := r.Get(ctx, types.NamespacedName{Name: claimName, Namespace: cluster.Namespace}, pvc)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return false, "", fmt.Errorf("reading PersistentVolumeClaim %q: %w", claimName, err)
+		}
+		clear = false
+		if pvc.DeletionTimestamp != nil {
+			continue
+		}
+		// The UID precondition keeps a claim created since the read from being the one deleted.
+		if err := r.Delete(ctx, pvc, client.Preconditions{UID: &pvc.UID}); err != nil && !apierrors.IsNotFound(err) {
+			return false, "", fmt.Errorf("deleting PersistentVolumeClaim %q: %w", claimName, err)
+		}
+		log.Info("Deleted PersistentVolumeClaim of a node that left the cluster", "name", claimName, "pod", name)
+	}
+	if !clear {
+		return false, fmt.Sprintf("waiting for the volumes %s used before it left to be deleted", name), nil
+	}
+	return true, "", nil
 }

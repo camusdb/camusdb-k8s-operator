@@ -19,7 +19,8 @@ The operator reads the roster from `GET /v1/cluster/membership` before each step
 - The peer Service publishes pods that are not ready yet, so the nodes can find each other.
 - The cluster is `Running` only when the roster lists every node as a voter.
 - The founding size is saved in `status.bootstrapSize` and never changes. A node with a lower
-  ordinal forms the cluster. A node with a higher ordinal joins the running cluster.
+  ordinal forms the cluster. A node with a higher ordinal joins the running cluster. Once the
+  cluster is running, any node that starts with no data joins it, whatever its ordinal.
 
 ## Scaling
 
@@ -31,6 +32,9 @@ The operator reads the roster from `GET /v1/cluster/membership` before each step
 - To remove a node, the operator first asks it to leave the cluster. It deletes the pod only after
   the cluster confirms. This needs [authentication](authentication.md). Without it, the operator
   deletes the pod and the cluster removes the node after about 10 minutes.
+- A node that left cannot rejoin on its old data: the cluster ignores it, and the scale-up never
+  finishes. Before the operator adds an ordinal back, it deletes the volumes that ordinal's earlier
+  node left, so the new node joins with empty volumes and copies its data from the cluster.
 - A scale does not restart the existing nodes. The cluster size is in a separate file that the
   pods read at startup, so the pod template does not change.
 
