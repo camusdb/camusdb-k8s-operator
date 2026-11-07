@@ -20,7 +20,7 @@ If either cannot be read, it waits. A rolling restart does not wait for the data
 
 To remove a node, the operator asks the highest-numbered node to leave, then deletes its pod. If
 the node refuses or cannot be reached, the scale waits. Without [authentication](authentication.md),
-or if the pod is already gone, the cluster removes the node after about 90 seconds.
+or if the pod is already gone, the cluster removes the node after about 10 minutes.
 
 Do not force-delete pods to make a stuck scale finish.
 

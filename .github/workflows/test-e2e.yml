@@ -18,7 +18,7 @@ jobs:
     # The suite walks a real cluster through bootstrap, a scale out and back, and a rolling
     # restart. Each membership change waits out SWIM's suspicion and eviction-grace windows, so
     # the wall-clock floor is minutes and no tuning removes it.
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

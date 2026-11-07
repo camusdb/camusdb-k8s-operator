@@ -46,8 +46,9 @@ const (
 	// a slow CI runner does not turn a timing difference into a failure.
 	membershipTimeout = 5 * time.Minute
 	// Without authentication a scale-down waits for the failure detector to evict each node,
-	// about 90 seconds per node on top of the operator's own steps.
-	evictionScaleDownTimeout = 10 * time.Minute
+	// about 10 minutes per node on top of the operator's own steps. Kommander's dead-member grace
+	// sets that wait, and CamusDB has no setting for it.
+	evictionScaleDownTimeout = 30 * time.Minute
 	bootstrapTimeout  = 4 * time.Minute
 	pollInterval      = 5 * time.Second
 )

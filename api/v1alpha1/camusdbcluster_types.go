@@ -573,7 +573,7 @@ type CamusDBClusterSpec struct {
 	// image moves on its own re-rolls every node on a registry push, and the generated command
 	// line is version-specific: a flag the new server no longer accepts stops the node at
 	// startup. Raise this default deliberately, once the flags are checked against that release.
-	// +kubebuilder:default="camusdb/camusdb:0.16.3"
+	// +kubebuilder:default="camusdb/camusdb:0.17.1"
 	// +optional
 	Image string `json:"image,omitempty"`
 

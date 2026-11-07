@@ -7,8 +7,9 @@
 - **Node-to-node HTTP is not encrypted.** CamusDB forwards some admin requests between nodes over
   the HTTP port, with a shared secret in a header. Raft and gRPC traffic is encrypted. Use a
   NetworkPolicy to restrict pod-to-pod traffic.
-- **Without authentication, scale-down is slow.** The cluster removes each node after about 90
-  seconds, and the node's data is not moved first.
+- **Without authentication, scale-down is slow.** The cluster removes each node after about 10
+  minutes, and the node's data is not moved first. CamusDB has no setting for this wait. Versions
+  before 0.17.1 wait about 2 minutes.
 - **New nodes copy data from the cluster, not from a backup.** CamusDB can start a new node from a
   backup, but the operator does not do this yet.
 - **A node that is away for a long time may need a full copy.** If the cluster has deleted the log

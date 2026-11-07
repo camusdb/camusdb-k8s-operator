@@ -20,7 +20,7 @@ Needs CamusDB 0.15.2 or later.
 Without authentication, CamusDB accepts admin calls only from the same machine. So these features
 need `spec.auth`:
 
-- Asking a node to leave before its pod is removed. Without it, a scale-down waits about 90 seconds
+- Asking a node to leave before its pod is removed. Without it, a scale-down waits about 10 minutes
   per node, and the node's data is not moved first.
 - [Autoscaling](autoscaling.md).
 - [Backups](backups.md).

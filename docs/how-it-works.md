@@ -30,7 +30,7 @@ The operator reads the roster from `GET /v1/cluster/membership` before each step
   first one's data is copied again could lose a copy.
 - To remove a node, the operator first asks it to leave the cluster. It deletes the pod only after
   the cluster confirms. This needs [authentication](authentication.md). Without it, the operator
-  deletes the pod and the cluster removes the node after about 90 seconds.
+  deletes the pod and the cluster removes the node after about 10 minutes.
 - A scale does not restart the existing nodes. The cluster size is in a separate file that the
   pods read at startup, so the pod template does not change.
 

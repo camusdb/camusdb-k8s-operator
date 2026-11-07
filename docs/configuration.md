@@ -2,7 +2,7 @@
 
 ## Server version
 
-`spec.image` defaults to `camusdb/camusdb:0.16.3`. The default is an exact version, not `latest`,
+`spec.image` defaults to `camusdb/camusdb:0.17.1`. The default is an exact version, not `latest`,
 because a moving tag would restart the cluster on every new release.
 
 Change the version on purpose. The operator builds the server command line for a known release, and

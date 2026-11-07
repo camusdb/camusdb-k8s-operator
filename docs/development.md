@@ -37,12 +37,11 @@ CAMUSDB_IMAGE=camusdb/camusdb:dev CAMUSDB_IMAGE_SKIP_PULL=true make test-e2e
 Run it twice, because authentication changes how nodes leave:
 
 ```bash
-E2E_AUTH=true make test-e2e   # about 6 minutes
-make test-e2e                 # about 9 minutes
+E2E_AUTH=true make test-e2e   # about 5 minutes
+make test-e2e                 # about 25 minutes
 ```
 
-It has 8 specs. Both runs passed 8 of 8 on `camusdb/camusdb:0.15.2`. The suite now uses 0.16.3, and
-it has not run on that version yet, nor with the placement checks or backups.
+It has 8 specs. Both runs passed 8 of 8 on `camusdb/camusdb:0.17.1`.
 
 The specs check:
 
@@ -52,6 +51,6 @@ The specs check:
 - The API server rejects `replicas: 2` and a change to `partitions`.
 - Scaling from 3 to 5 adds one node at a time and does not restart the existing pods.
 - Scaling from 5 to 3 removes one node at a time: with authentication, through the leave call (about
-  36 seconds); without it, by eviction (about 4.6 minutes).
+  31 seconds); without it, by eviction (about 21 minutes).
 - Data written before the scale is still readable after 3 → 5 → 3.
 - A `spec.config` change restarts one pod at a time, with no container restarts.
