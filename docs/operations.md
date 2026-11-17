@@ -62,6 +62,10 @@ kubectl -n camusdb logs camusdb-0 --tail=100
 A change to the image, the config or the certificate restarts the nodes one at a time. A change to
 the size does not restart existing nodes.
 
+A stopping pod keeps serving for 5 seconds before CamusDB is told to stop, so the client Service
+stops sending it new connections first. The wait counts against `terminationGracePeriodSeconds`;
+below 15 seconds it is a third of the period.
+
 A CamusDB release that changes its storage format starts with an empty store. Do not upgrade a live
 cluster across such a release. Move the data with a
 [dump and reimport](https://github.com/camusdb/camusdb/blob/main/docs/logical-dump-and-reimport.md)

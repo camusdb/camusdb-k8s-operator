@@ -287,6 +287,31 @@ func desiredBackupClaim(cluster *camusdbv1alpha1.CamusDBCluster) *corev1.Persist
 	return &pvc
 }
 
+// preStopSleepSeconds is how long a stopping pod keeps serving before CamusDB is told to stop.
+const preStopSleepSeconds = 5
+
+// containerLifecycle keeps a stopping pod serving for preStopSleepSeconds before Kubernetes sends
+// the server SIGTERM.
+//
+// Removing a terminating pod from the client Service takes a moment to reach every node's
+// kube-proxy, and until it has, new client connections can still be routed to the pod. CamusDB stops
+// listening as soon as it gets SIGTERM, so without the wait those connections are refused: on kind
+// a rolling restart under load refused one or two per pod. Peers reach the pod by its own DNS name,
+// not through the Service, so the wait does not delay the leadership hand-off.
+//
+// The wait counts against the termination grace period, so a short grace period gets a shorter
+// wait, a third of it, leaving the server the rest to shut down; under 3 seconds there is none.
+func containerLifecycle(cluster *camusdbv1alpha1.CamusDBCluster) *corev1.Lifecycle {
+	seconds := int64(preStopSleepSeconds)
+	if grace := cluster.Spec.TerminationGracePeriodSeconds; grace != nil {
+		seconds = min(seconds, *grace/3)
+	}
+	if seconds <= 0 {
+		return nil
+	}
+	return &corev1.Lifecycle{PreStop: &corev1.LifecycleHandler{Sleep: &corev1.SleepAction{Seconds: seconds}}}
+}
+
 // desiredStatefulSet builds the StatefulSet backing the cluster.
 //
 // partition is the rolling-update partition the operator wants held right now; pods below it are
@@ -360,6 +385,7 @@ func desiredStatefulSet(cluster *camusdbv1alpha1.CamusDBCluster, partition int32
 						// The image's own entrypoint hardcodes a single-node identity, so it is
 						// replaced with the generated script.
 						Command:         []string{"/bin/bash", entrypointPath},
+						Lifecycle:       containerLifecycle(cluster),
 						Env:             containerEnv(cluster),
 						Resources:       cluster.Spec.Resources,
 						SecurityContext: cluster.Spec.SecurityContext,

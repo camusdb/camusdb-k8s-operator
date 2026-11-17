@@ -695,7 +695,10 @@ type CamusDBClusterSpec struct {
 	// +optional
 	SecurityContext *corev1.SecurityContext `json:"securityContext,omitempty"`
 
-	// terminationGracePeriodSeconds for the CamusDB pods.
+	// terminationGracePeriodSeconds for the CamusDB pods. A stopping pod keeps serving for 5 seconds
+	// before CamusDB is told to stop, so the client Service stops sending it connections first. The
+	// wait counts against this period: below 15 seconds it is a third of the period, and below 3
+	// there is none.
 	// +optional
 	TerminationGracePeriodSeconds *int64 `json:"terminationGracePeriodSeconds,omitempty"`
 
