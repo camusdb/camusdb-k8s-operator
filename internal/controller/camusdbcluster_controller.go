@@ -213,7 +213,7 @@ func (r *CamusDBClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		persisted = cluster.Status.DeepCopy()
 	}
 
-	sts, err := r.reconcileStatefulSet(ctx, cluster, acc, bootstrapped, membership, placement, placementErr, pods, rc, keystore)
+	sts, holdReason, err := r.reconcileStatefulSet(ctx, cluster, acc, bootstrapped, membership, placement, placementErr, pods, rc, keystore)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconciling stateful set: %w", err)
 	}
@@ -221,7 +221,7 @@ func (r *CamusDBClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// The backup scheduler edits cluster.Status in memory too, and reconcileStatus persists it.
 	backupWake := r.reconcileBackup(ctx, cluster, acc, membership, pods, rc)
 
-	result, err := r.reconcileStatus(ctx, cluster, persisted, sts, pods, membership, membershipErr, keystore)
+	result, err := r.reconcileStatus(ctx, cluster, persisted, sts, holdReason, pods, membership, membershipErr, keystore)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating status: %w", err)
 	}
@@ -305,8 +305,9 @@ type keystoreInfo struct {
 
 // reconcileStatefulSet creates or updates the StatefulSet, applying the size and rolling-update
 // partition that buildPlan considers safe right now. It returns nil when there is no StatefulSet
-// yet and none may be created.
-func (r *CamusDBClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *camusdbv1alpha1.CamusDBCluster, acc *nodeAccess, bootstrapped bool, membership *camusdb.Membership, placement *camusdb.Placement, placementErr error, pods []corev1.Pod, rc rendered, keystore keystoreInfo) (*appsv1.StatefulSet, error) {
+// yet and none may be created. holdReason says why a scale step or the rolling update was held on
+// this pass, and is empty when nothing was.
+func (r *CamusDBClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *camusdbv1alpha1.CamusDBCluster, acc *nodeAccess, bootstrapped bool, membership *camusdb.Membership, placement *camusdb.Placement, placementErr error, pods []corev1.Pod, rc rendered, keystore keystoreInfo) (*appsv1.StatefulSet, string, error) {
 	// bootstrapped decides whether a scale step may be taken at all, not what the pods look like.
 	existing := &appsv1.StatefulSet{}
 	err := r.Get(ctx, types.NamespacedName{Name: stsName(cluster), Namespace: cluster.Namespace}, existing)
@@ -317,20 +318,20 @@ func (r *CamusDBClusterReconciler) reconcileStatefulSet(ctx context.Context, clu
 		// appeared — and a rolling update waits for each replaced pod to become ready, which no
 		// founding node can do alone. Bootstrap would deadlock.
 		if !keystore.ready {
-			return nil, nil
+			return nil, "", nil
 		}
 		// Nothing is running yet, so there is nothing a template change could disrupt, and a
 		// greenfield cluster needs every node up at once to form its first quorum.
 		desired := desiredStatefulSet(cluster, 0, rc, keystore.digest)
 		if err := controllerutil.SetControllerReference(cluster, desired, r.Scheme); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		if err := r.Create(ctx, desired); err != nil {
-			return nil, err
+			return nil, "", err
 		}
-		return desired, nil
+		return desired, "", nil
 	case err != nil:
-		return nil, err
+		return nil, "", err
 	}
 
 	currentReplicas := int32(0)
@@ -361,7 +362,7 @@ func (r *CamusDBClusterReconciler) reconcileStatefulSet(ctx context.Context, clu
 	if ordinal := currentReplicas; bootstrapped && p.Replicas > currentReplicas {
 		cleared, reason, err := r.clearDepartedVolumes(ctx, cluster, membership, pods, ordinal)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		if !cleared {
 			p.Replicas = currentReplicas
@@ -390,14 +391,15 @@ func (r *CamusDBClusterReconciler) reconcileStatefulSet(ctx context.Context, clu
 		sts.Spec.PersistentVolumeClaimRetentionPolicy = desired.Spec.PersistentVolumeClaimRetentionPolicy
 		return controllerutil.SetControllerReference(cluster, sts, r.Scheme)
 	}); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return sts, nil
+	return sts, p.Reason, nil
 }
 
 // reconcileStatus recomputes status from the StatefulSet, the pods behind it, and the committed
 // Raft roster. persisted is the status as stored, which decides whether a write is needed.
-func (r *CamusDBClusterReconciler) reconcileStatus(ctx context.Context, cluster *camusdbv1alpha1.CamusDBCluster, persisted *camusdbv1alpha1.CamusDBClusterStatus, sts *appsv1.StatefulSet, pods []corev1.Pod, membership *camusdb.Membership, membershipErr error, keystore keystoreInfo) (ctrl.Result, error) {
+// holdReason is why reconcileStatefulSet held a step on this pass; Progressing carries it.
+func (r *CamusDBClusterReconciler) reconcileStatus(ctx context.Context, cluster *camusdbv1alpha1.CamusDBCluster, persisted *camusdbv1alpha1.CamusDBClusterStatus, sts *appsv1.StatefulSet, holdReason string, pods []corev1.Pod, membership *camusdb.Membership, membershipErr error, keystore keystoreInfo) (ctrl.Result, error) {
 	desired := desiredReplicas(cluster)
 
 	current := &appsv1.StatefulSet{}
@@ -446,10 +448,16 @@ func (r *CamusDBClusterReconciler) reconcileStatus(ctx context.Context, cluster 
 	}
 
 	rosterConverged := rosterKnown && status.Voters == desired && status.Learners == 0
-	// An image rollout can sit between two pod restarts with every node ready, so readiness alone
-	// would report the cluster Running half-way through it.
+	// A rolling restart sits between two pod restarts with every node ready, so readiness alone
+	// would report the cluster Running half-way through it. The image is one thing a roll delivers;
+	// a spec.config change, a renewed keystore or new resources give the pod template a new
+	// revision and roll the nodes the same way.
 	imageCurrent := status.CurrentImage == cluster.Spec.Image
-	progressing := status.ReadyReplicas < desired || !rosterConverged || !imageCurrent
+	templateCurrent := templateRolledOut(sts)
+	// A scale-down is not finished when the roster is: with authentication both leave calls of a
+	// 5 -> 3 commit in about a second, and the departed nodes' pods take their grace period to stop.
+	progressing := status.Replicas != desired || status.ReadyReplicas < desired || !rosterConverged ||
+		!imageCurrent || !templateCurrent
 
 	status.Phase = clusterPhase(status, desired, keystore.ready, rosterKnown, progressing)
 
@@ -457,8 +465,15 @@ func (r *CamusDBClusterReconciler) reconcileStatus(ctx context.Context, cluster 
 		"KeystoreAvailable", "KeystorePending", keystoreOrDefault(keystore.message))
 
 	progressMsg := fmt.Sprintf("%d/%d nodes ready, %d voters", status.ReadyReplicas, desired, status.Voters)
-	if !imageCurrent {
+	switch {
+	case !imageCurrent:
 		progressMsg += fmt.Sprintf(", rolling out image %s", cluster.Spec.Image)
+	case !templateCurrent:
+		progressMsg += fmt.Sprintf(", rolling out a pod template change (%d of %d nodes updated)",
+			sts.Status.UpdatedReplicas, sts.Status.Replicas)
+	}
+	if holdReason != "" {
+		progressMsg += "; " + holdReason
 	}
 	setCondition(status, camusdbv1alpha1.ConditionProgressing, progressing,
 		"Converging", "Converged", progressMsg)
@@ -478,7 +493,7 @@ func (r *CamusDBClusterReconciler) reconcileStatus(ctx context.Context, cluster 
 		}
 	}
 
-	if progressing || status.Replicas != desired {
+	if progressing {
 		return ctrl.Result{RequeueAfter: requeueProgressing}, nil
 	}
 	if cluster.Spec.Autoscaling != nil {
@@ -535,6 +550,18 @@ func imageRolledOut(cluster *camusdbv1alpha1.CamusDBCluster, sts *appsv1.Statefu
 		seen++
 	}
 	return replicas > 0 && seen == replicas
+}
+
+// templateRolledOut reports whether every pod runs the StatefulSet's current pod template.
+//
+// The StatefulSet controller moves currentRevision to updateRevision only once every pod has been
+// recreated from the new template and is ready. The two therefore differ for the whole of a rolling
+// update: between two restarts when every node is ready, and while the operator holds the
+// partition. observedGeneration is not consulted, because a replica or partition change bumps the
+// generation too, and every scale step would then read as a roll until the controller caught up.
+// A StatefulSet the controller has not processed yet has neither revision, which reads as current.
+func templateRolledOut(sts *appsv1.StatefulSet) bool {
+	return sts.Status.UpdateRevision == sts.Status.CurrentRevision
 }
 
 // keystoreOrDefault supplies a message for the ready case, where there is nothing to explain.

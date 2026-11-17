@@ -442,19 +442,27 @@ spec:
 		mustKubectl("-n", testNamespace, "patch", "camusdbcluster", clusterName,
 			"--type=merge", "-p", `{"spec":{"config":{"slow_query_log_enabled":true}}}`)
 
-		// The roll is observable as every pod getting a new UID.
+		// The roll is observable as every pod getting a new UID. Between the first restart and the
+		// last, the cluster must not call itself Running: every node is ready between two restarts,
+		// and readiness alone once reported that moment as converged.
+		var runningMidRoll []string
 		Eventually(func() bool {
 			after := podUIDs()
 			if len(after) != len(before) {
 				return false
 			}
+			replaced := 0
 			for name, uid := range before {
-				if after[name] == uid {
-					return false
+				if after[name] != uid {
+					replaced++
 				}
 			}
-			return true
+			if replaced > 0 && replaced < len(before) && clusterField("{.status.phase}") == "Running" {
+				runningMidRoll = append(runningMidRoll, fmt.Sprintf("%d of %d replaced", replaced, len(before)))
+			}
+			return replaced == len(before)
 		}, membershipTimeout, pollInterval).Should(BeTrue(), "the cluster never rolled")
+		Expect(runningMidRoll).To(BeEmpty(), "the cluster reported Running part-way through the roll")
 
 		expectConverged(3)
 

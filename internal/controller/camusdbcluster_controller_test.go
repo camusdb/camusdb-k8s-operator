@@ -39,6 +39,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -415,6 +416,9 @@ var _ = Describe("CamusDBCluster Controller", func() {
 		// Until the new node is a committed Voter, no further step is taken.
 		reconcileWith(rosterOf(cluster, 3), nil)
 		Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)))
+		progressing := apimeta.FindStatusCondition(getCluster().Status.Conditions, camusdbv1alpha1.ConditionProgressing)
+		Expect(progressing.Message).To(ContainSubstring(
+			fmt.Sprintf("waiting for [%s] to become voters", podName(cluster, 3))), "the held step did not say why")
 
 		reconcileWith(rosterOf(cluster, 4), nil)
 		Expect(*getSTS().Spec.Replicas).To(Equal(int32(5)))
@@ -494,6 +498,8 @@ var _ = Describe("CamusDBCluster Controller", func() {
 		moving.Partitions[0].Replicas[0].Role = camusdb.RoleLearner
 		reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 4), placement: moving})
 		Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)), "stacked a scale-up on replica moves still in flight")
+		progressing := apimeta.FindStatusCondition(getCluster().Status.Conditions, camusdbv1alpha1.ConditionProgressing)
+		Expect(progressing.Message).To(ContainSubstring("waiting for replica placement to settle"))
 
 		// A placement that cannot be read holds the step too.
 		reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 4), placementErr: fmt.Errorf("connection refused")})
@@ -544,6 +550,70 @@ var _ = Describe("CamusDBCluster Controller", func() {
 		out = getCluster()
 		Expect(out.Status.CurrentImage).To(Equal("camusdb/camusdb:next"))
 		Expect(out.Status.Phase).To(Equal(camusdbv1alpha1.PhaseRunning))
+	})
+
+	It("reports a configuration roll as progressing until every pod runs the new template", func() {
+		// The first pass creates the StatefulSet; the second sees it ready.
+		reconcileWith(rosterOf(cluster, 3), nil)
+		reconcileWith(rosterOf(cluster, 3), nil)
+		Expect(getCluster().Status.Phase).To(Equal(camusdbv1alpha1.PhaseRunning))
+		before := getSTS().Spec.Template.Annotations[configHashAnnotation]
+
+		obj := getCluster()
+		obj.Spec.Config = &runtime.RawExtension{Raw: []byte(`{"slow_query_log_enabled": true}`)}
+		Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+		reconcileWith(rosterOf(cluster, 3), nil)
+		Expect(getSTS().Spec.Template.Annotations[configHashAnnotation]).NotTo(Equal(before),
+			"the configuration change did not reach the pod template")
+
+		// setRevisions stands in for the StatefulSet controller part-way through the roll.
+		setRevisions := func(current, update string, updated int32) {
+			sts := getSTS()
+			sts.Status.CurrentRevision = current
+			sts.Status.UpdateRevision = update
+			sts.Status.UpdatedReplicas = updated
+			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+		}
+
+		// One node restarted onto the new template and every node is ready again: the moment
+		// between two restarts that readiness alone would call Running.
+		setRevisions("camus-old", "camus-new", 1)
+		reconcileWith(rosterOf(cluster, 3), nil)
+		out := getCluster()
+		Expect(out.Status.Phase).To(Equal(camusdbv1alpha1.PhaseUpgrading))
+		progressing := apimeta.FindStatusCondition(out.Status.Conditions, camusdbv1alpha1.ConditionProgressing)
+		Expect(progressing.Status).To(Equal(metav1.ConditionTrue))
+		Expect(progressing.Message).To(ContainSubstring("rolling out a pod template change (1 of 3 nodes updated)"))
+
+		// The StatefulSet controller moves currentRevision only once every pod is updated and ready.
+		setRevisions("camus-new", "camus-new", 3)
+		reconcileWith(rosterOf(cluster, 3), nil)
+		out = getCluster()
+		Expect(out.Status.Phase).To(Equal(camusdbv1alpha1.PhaseRunning))
+		progressing = apimeta.FindStatusCondition(out.Status.Conditions, camusdbv1alpha1.ConditionProgressing)
+		Expect(progressing.Status).To(Equal(metav1.ConditionFalse))
+		Expect(progressing.Message).NotTo(ContainSubstring("rolling out"))
+	})
+
+	It("stays progressing while the pods of nodes that left are still stopping", func() {
+		reconcileWith(rosterOf(cluster, 3), nil)
+		reconcileWith(rosterOf(cluster, 3), nil)
+		Expect(getCluster().Status.Phase).To(Equal(camusdbv1alpha1.PhaseRunning))
+
+		// Both nodes of a 5 -> 3 scale-down left the roster through the leave call, and their pods
+		// are within their grace period: the StatefulSet still counts five. reconcileUsing would
+		// resync that count from the spec, so the pass is run directly.
+		sts := getSTS()
+		sts.Status.Replicas = 5
+		Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+		reconciler.CamusDB = &fakeCamusDB{membership: rosterOf(cluster, 3)}
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+		Expect(err).NotTo(HaveOccurred())
+
+		out := getCluster()
+		Expect(out.Status.Phase).To(Equal(camusdbv1alpha1.PhaseScalingDown))
+		progressing := apimeta.FindStatusCondition(out.Status.Conditions, camusdbv1alpha1.ConditionProgressing)
+		Expect(progressing.Status).To(Equal(metav1.ConditionTrue), "reported Converged with pods still stopping")
 	})
 
 	It("asks the departing node to leave before removing its pod", func() {

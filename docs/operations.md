@@ -39,7 +39,7 @@ kubectl -n camusdb logs camusdb-0 --tail=100
 | `status.members` | The cluster's member list, with the pod for each member. |
 | `status.currentImage` | The image every node runs. |
 | `Available` | A majority of nodes is ready. |
-| `Progressing` | The operator is starting, scaling or upgrading. |
+| `Progressing` | The operator is starting, scaling, or restarting the nodes onto a new image, config or certificate. While a step waits, the message says why. |
 | `RosterConverged` | The member list matches the size you asked for. If it cannot be read, the message says why. |
 | `KeystoreReady` | The certificate Secret exists. |
 | `AutoscalingLimited` | See [Autoscaling](autoscaling.md). |
