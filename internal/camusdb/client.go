@@ -396,6 +396,12 @@ const maxTransports = 256
 // ErrUnauthorized means the node rejected the operator's credentials.
 var ErrUnauthorized = errors.New("the node rejected the operator's credentials")
 
+// ErrMustRetry is CamusDB's CADB0504 refusal, "retry the operation". Nothing was done, and the same
+// request can succeed a moment later: a node answers it, for example, while a partition it has to
+// read from is electing a new leader. Its text is the code, so a wrapped error reads as the server's
+// own "CADB0504 <message>".
+var ErrMustRetry = errors.New("CADB0504")
+
 type cachedToken struct {
 	token   string
 	expires time.Time
@@ -625,6 +631,9 @@ func statusError(path string, code int, body []byte) error {
 	_ = json.Unmarshal(body, &e)
 	if code == http.StatusUnauthorized {
 		return fmt.Errorf("%s: %w", path, ErrUnauthorized)
+	}
+	if e.Code == ErrMustRetry.Error() {
+		return fmt.Errorf("%s returned HTTP %d: %w %s", path, code, ErrMustRetry, e.Message)
 	}
 	if e.Code != "" || e.Message != "" {
 		return fmt.Errorf("%s returned HTTP %d: %s %s", path, code, e.Code, e.Message)

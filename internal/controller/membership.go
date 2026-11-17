@@ -21,10 +21,12 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -155,19 +157,58 @@ func (r *CamusDBClusterReconciler) readMembership(ctx context.Context, cluster *
 		return int(ordinalOf(a.Name) - ordinalOf(b.Name))
 	})
 
-	var lastErr error
+	// A node that stops while it leads the partition holding the authentication catalog leaves that
+	// partition without a leader for one election timeout, 2 to 4 seconds, and meanwhile every node
+	// answers every authenticated call with CADB0504. That is a planned restart doing what Raft does,
+	// not a roster the operator cannot read, so the nodes are asked again until the refusals stop or
+	// the budget runs out. A refusal that outlasts the budget is reported as before.
+	deadline := time.Now().Add(membershipRetryBudget)
+	for {
+		m, err := r.askForMembership(ctx, cluster, acc, candidates)
+		if err == nil || !errors.Is(err, camusdb.ErrMustRetry) || time.Now().Add(membershipRetryPause).After(deadline) {
+			return m, err
+		}
+		logf.FromContext(ctx).V(1).Info("Could not read cluster membership yet, asking again", "error", err)
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-time.After(membershipRetryPause):
+		}
+	}
+}
+
+// membershipRetryBudget and membershipRetryPause bound how long readMembership keeps asking while
+// the nodes answer CADB0504, and how long it waits between rounds. A round costs little: a node
+// that refuses this way answers in a few milliseconds. Variables so that tests can shorten them.
+var (
+	membershipRetryBudget = 5 * time.Second
+	membershipRetryPause  = 500 * time.Millisecond
+)
+
+// askForMembership asks each candidate in turn and returns the first roster it gets. When none
+// answers, a CADB0504 refusal is returned in preference to any other failure: it is the one that
+// says the cluster is up and why it could not answer.
+func (r *CamusDBClusterReconciler) askForMembership(ctx context.Context, cluster *camusdbv1alpha1.CamusDBCluster, acc *nodeAccess, candidates []corev1.Pod) (*camusdb.Membership, error) {
+	var lastErr, retryErr error
 	for i := range candidates {
 		m, err := r.CamusDB.Membership(ctx, acc.target(cluster, &candidates[i]))
 		if err != nil {
 			lastErr = err
+			if errors.Is(err, camusdb.ErrMustRetry) {
+				retryErr = err
+			}
 			continue
 		}
 		return m, nil
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no pod was reachable")
+	switch {
+	case retryErr != nil:
+		return nil, retryErr
+	case lastErr != nil:
+		return nil, lastErr
+	default:
+		return nil, fmt.Errorf("no pod was reachable")
 	}
-	return nil, lastErr
 }
 
 // readPlacement asks a ready node for the committed replica placement. Any node can answer, but

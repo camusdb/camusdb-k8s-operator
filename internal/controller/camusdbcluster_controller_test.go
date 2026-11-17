@@ -55,6 +55,9 @@ import (
 type fakeCamusDB struct {
 	membership *camusdb.Membership
 	err        error
+	// mustRetry is how many Membership calls answer CADB0504 before the roster is returned: every
+	// node answers so while a partition it reads from elects a leader.
+	mustRetry int
 	// leaveResult is what a decommission request returns; nil means a committed removal.
 	leaveResult *camusdb.LeaveResult
 	leaveErr    error
@@ -133,6 +136,11 @@ func (f *fakeCamusDB) Membership(_ context.Context, t camusdb.Target) (*camusdb.
 	f.targets = append(f.targets, t)
 	if f.err != nil {
 		return nil, f.err
+	}
+	if f.mustRetry > 0 {
+		f.mustRetry--
+		return nil, fmt.Errorf("/v1/cluster/membership returned HTTP 500: %w The authentication catalog could not be read (MustRetry); retry the operation",
+			camusdb.ErrMustRetry)
 	}
 	return f.membership, nil
 }
@@ -614,6 +622,37 @@ var _ = Describe("CamusDBCluster Controller", func() {
 		Expect(out.Status.Phase).To(Equal(camusdbv1alpha1.PhaseScalingDown))
 		progressing := apimeta.FindStatusCondition(out.Status.Conditions, camusdbv1alpha1.ConditionProgressing)
 		Expect(progressing.Status).To(Equal(metav1.ConditionTrue), "reported Converged with pods still stopping")
+	})
+
+	It("rides out a leader election instead of calling the roster unreadable", func() {
+		reconcileWith(rosterOf(cluster, 3), nil)
+		reconcileWith(rosterOf(cluster, 3), nil)
+		Expect(getCluster().Status.Phase).To(Equal(camusdbv1alpha1.PhaseRunning))
+
+		// A node that led the partition holding the authentication catalog has stopped: for one round
+		// every node answers CADB0504, and the next round answers.
+		fake := reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 3), mustRetry: 3})
+		Expect(fake.mustRetry).To(BeZero(), "did not ask every node before asking again")
+
+		out := getCluster()
+		Expect(out.Status.Phase).To(Equal(camusdbv1alpha1.PhaseRunning), "reported a leader election as Degraded")
+		roster := apimeta.FindStatusCondition(out.Status.Conditions, camusdbv1alpha1.ConditionRosterConverged)
+		Expect(roster.Status).To(Equal(metav1.ConditionTrue))
+	})
+
+	It("still reports a CADB0504 refusal that outlasts the retry budget", func() {
+		budget, pause := membershipRetryBudget, membershipRetryPause
+		membershipRetryBudget, membershipRetryPause = 300*time.Millisecond, 50*time.Millisecond
+		DeferCleanup(func() { membershipRetryBudget, membershipRetryPause = budget, pause })
+
+		reconcileWith(rosterOf(cluster, 3), nil)
+		reconcileWith(rosterOf(cluster, 3), nil)
+		reconcileUsing(&fakeCamusDB{membership: rosterOf(cluster, 3), mustRetry: 1000})
+
+		out := getCluster()
+		Expect(out.Status.Phase).To(Equal(camusdbv1alpha1.PhaseDegraded))
+		roster := apimeta.FindStatusCondition(out.Status.Conditions, camusdbv1alpha1.ConditionRosterConverged)
+		Expect(roster.Message).To(ContainSubstring("CADB0504 The authentication catalog could not be read"))
 	})
 
 	It("asks the departing node to leave before removing its pod", func() {

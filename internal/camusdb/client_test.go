@@ -194,6 +194,42 @@ func TestHealthAcceptsServiceUnavailable(t *testing.T) {
 	}
 }
 
+func TestMustRetryRefusalIsRecognised(t *testing.T) {
+	// What every node answers while the partition holding the authentication catalog has no leader.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"status":"failed","code":"CADB0504","message":"The authentication catalog could not be read (MustRetry); retry the operation"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewHTTPClient(testLeaveTimeout, testLeaveTimeout)
+
+	_, err := c.Membership(context.Background(), Target{BaseURL: srv.URL})
+	if !errors.Is(err, ErrMustRetry) {
+		t.Fatalf("Membership error = %v, want one wrapping ErrMustRetry", err)
+	}
+	const want = "/v1/cluster/membership returned HTTP 500: CADB0504 The authentication catalog could not be read (MustRetry); retry the operation"
+	if err.Error() != want {
+		t.Errorf("error text = %q, want %q", err.Error(), want)
+	}
+}
+
+func TestOtherRefusalsAreNotMustRetry(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"status":"failed","code":"CADB0001","message":"something else"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewHTTPClient(testLeaveTimeout, testLeaveTimeout)
+
+	if _, err := c.Membership(context.Background(), Target{BaseURL: srv.URL}); err == nil || errors.Is(err, ErrMustRetry) {
+		t.Fatalf("Membership error = %v, want a failure that is not ErrMustRetry", err)
+	}
+}
+
 // authServer is a TLS node with authentication on. It issues token "tok-<n>" on the n-th login and
 // accepts only the newest one, so a test can make it revoke a token by logging in elsewhere.
 type authServer struct {
